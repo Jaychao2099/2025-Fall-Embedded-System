@@ -1,0 +1,12 @@
+*.txt
+*.m4a
+*.mp3
+*.wav
+opencv*/
+*.tar
+*.tar.bz2
+*.zip
+.vscode/
+._.DS_Store
+.DS_Store
+Thumbs.db
