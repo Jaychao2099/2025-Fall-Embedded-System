@@ -83,7 +83,7 @@ bool scanDataset(const string& datasetPath, const CascadeClassifier& faceCascade
     }
     closedir(dir);
     
-    // 排序以確保一致性
+    // 按照字典序排序以確保一致性
     sort(userDirs.begin(), userDirs.end());
     
     // 遍歷所有使用者目錄
