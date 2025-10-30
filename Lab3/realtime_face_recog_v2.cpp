@@ -19,7 +19,7 @@ volatile sig_atomic_t running = 1;
 
 // 信號處理函數
 void signalHandler(int signum) {
-    cout << "\n接收到中斷信號 (" << signum << ")，準備退出..." << endl;
+    cout << "\nready to exit..." << endl;
     running = 0;
 }
 
@@ -37,19 +37,19 @@ public:
         // 開啟 framebuffer 設備
         fbFd = open(device, O_RDWR);
         if (fbFd == -1) {
-            throw runtime_error("無法開啟 framebuffer 設備: " + string(device));
+            throw runtime_error("cannot open framebuffer device: " + string(device));
         }
         
         // 獲取固定螢幕資訊
         if (ioctl(fbFd, FBIOGET_FSCREENINFO, &finfo) == -1) {
             close(fbFd);
-            throw runtime_error("無法讀取固定螢幕資訊");
+            throw runtime_error("cannot read fixed screen info");
         }
         
         // 獲取可變螢幕資訊
         if (ioctl(fbFd, FBIOGET_VSCREENINFO, &vinfo) == -1) {
             close(fbFd);
-            throw runtime_error("無法讀取可變螢幕資訊");
+            throw runtime_error("cannot read variable screen info");
         }
         
         // 計算螢幕大小
@@ -59,13 +59,13 @@ public:
         fbp = (unsigned char*)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED, fbFd, 0);
         if (fbp == MAP_FAILED) {
             close(fbFd);
-            throw runtime_error("無法映射 framebuffer 到記憶體");
+            throw runtime_error("cannot map framebuffer to memory");
         }
         
-        cout << "Framebuffer 初始化成功:" << endl;
-        cout << "  解析度: " << vinfo.xres << "x" << vinfo.yres << endl;
-        cout << "  色彩深度: " << vinfo.bits_per_pixel << " bits" << endl;
-        cout << "  行長度: " << finfo.line_length << " bytes" << endl;
+        cout << "  Init Framebuffer :" << endl;
+        cout << "  Resolution: " << vinfo.xres << "x" << vinfo.yres << endl;
+        cout << "  Color Depth: " << vinfo.bits_per_pixel << " bits" << endl;
+        cout << "  Line Length: " << finfo.line_length << " bytes" << endl;
     }
     
     ~FrameBuffer() {
@@ -77,7 +77,7 @@ public:
         }
     }
     
-    // 顯示影像到 framebuffer（置中顯示）
+    // 顯示影像到 framebuffer
     void displayImage(const Mat& frame) {
         // 確保影像是 BGR 格式
         Mat bgrFrame;
@@ -87,26 +87,22 @@ public:
             bgrFrame = frame;
         }
         
-        // 計算置中位置
-        int offsetX = (vinfo.xres - bgrFrame.cols) / 2;
-        int offsetY = (vinfo.yres - bgrFrame.rows) / 2;
+        // 調整影像大小以符合螢幕
+        Mat resizedFrame;
+        resize(bgrFrame, resizedFrame, Size(vinfo.xres, vinfo.yres));
         
-        // 確保偏移量不為負
-        offsetX = max(0, offsetX);
-        offsetY = max(0, offsetY);
-        
-        // 清空螢幕（填充黑色）
-        clearScreen();
-        
-        // 根據色彩深度轉換並寫入（置中）
+        // 根據色彩深度轉換並寫入
         if (vinfo.bits_per_pixel == 32) {
-            writeRGB32Centered(bgrFrame, offsetX, offsetY);
+            // 32 位元 (RGBA/BGRA)
+            writeRGB32(resizedFrame);
         } else if (vinfo.bits_per_pixel == 24) {
-            writeRGB24Centered(bgrFrame, offsetX, offsetY);
+            // 24 位元 (RGB/BGR)
+            writeRGB24(resizedFrame);
         } else if (vinfo.bits_per_pixel == 16) {
-            writeRGB16Centered(bgrFrame, offsetX, offsetY);
+            // 16 位元 (RGB565)
+            writeRGB16(resizedFrame);
         } else {
-            cerr << "不支援的色彩深度: " << vinfo.bits_per_pixel << endl;
+            cerr << "unsupported color depth: " << vinfo.bits_per_pixel << endl;
         }
     }
     
@@ -114,49 +110,42 @@ public:
     int getHeight() const { return vinfo.yres; }
     
 private:
-    void clearScreen() {
-        memset(fbp, 0, screensize);
-    }
-    
-    void writeRGB32Centered(const Mat& frame, int offsetX, int offsetY) {
-        for (int y = 0; y < frame.rows && (y + offsetY) < (int)vinfo.yres; y++) {
-            long location = (y + offsetY) * finfo.line_length;
-            for (int x = 0; x < frame.cols && (x + offsetX) < (int)vinfo.xres; x++) {
+    void writeRGB32(const Mat& frame) {
+        for (int y = 0; y < frame.rows; y++) {
+            long location = y * finfo.line_length;
+            for (int x = 0; x < frame.cols; x++) {
                 Vec3b pixel = frame.at<Vec3b>(y, x);
-                long pos = location + (x + offsetX) * 4;
-                *(fbp + pos + 0) = pixel[0]; // B
-                *(fbp + pos + 1) = pixel[1]; // G
-                *(fbp + pos + 2) = pixel[2]; // R
-                *(fbp + pos + 3) = 0;        // A
+                *(fbp + location + x * 4 + 0) = pixel[0]; // B
+                *(fbp + location + x * 4 + 1) = pixel[1]; // G
+                *(fbp + location + x * 4 + 2) = pixel[2]; // R
+                *(fbp + location + x * 4 + 3) = 0;        // A
             }
         }
     }
     
-    void writeRGB24Centered(const Mat& frame, int offsetX, int offsetY) {
-        for (int y = 0; y < frame.rows && (y + offsetY) < (int)vinfo.yres; y++) {
-            long location = (y + offsetY) * finfo.line_length;
-            for (int x = 0; x < frame.cols && (x + offsetX) < (int)vinfo.xres; x++) {
+    void writeRGB24(const Mat& frame) {
+        for (int y = 0; y < frame.rows; y++) {
+            long location = y * finfo.line_length;
+            for (int x = 0; x < frame.cols; x++) {
                 Vec3b pixel = frame.at<Vec3b>(y, x);
-                long pos = location + (x + offsetX) * 3;
-                *(fbp + pos + 0) = pixel[2]; // R
-                *(fbp + pos + 1) = pixel[1]; // G
-                *(fbp + pos + 2) = pixel[0]; // B
+                *(fbp + location + x * 3 + 0) = pixel[2]; // R
+                *(fbp + location + x * 3 + 1) = pixel[1]; // G
+                *(fbp + location + x * 3 + 2) = pixel[0]; // B
             }
         }
     }
     
-    void writeRGB16Centered(const Mat& frame, int offsetX, int offsetY) {
-        for (int y = 0; y < frame.rows && (y + offsetY) < (int)vinfo.yres; y++) {
-            long location = (y + offsetY) * finfo.line_length;
-            for (int x = 0; x < frame.cols && (x + offsetX) < (int)vinfo.xres; x++) {
+    void writeRGB16(const Mat& frame) {
+        for (int y = 0; y < frame.rows; y++) {
+            long location = y * finfo.line_length;
+            for (int x = 0; x < frame.cols; x++) {
                 Vec3b pixel = frame.at<Vec3b>(y, x);
                 // RGB565 格式: RRRRR GGGGGG BBBBB
                 unsigned short rgb565 = 
                     ((pixel[2] >> 3) << 11) |  // R: 5 bits
                     ((pixel[1] >> 2) << 5) |   // G: 6 bits
                     (pixel[0] >> 3);           // B: 5 bits
-                long pos = location + (x + offsetX) * 2;
-                *((unsigned short*)(fbp + pos)) = rgb565;
+                *((unsigned short*)(fbp + location + x * 2)) = rgb565;
             }
         }
     }
@@ -183,21 +172,21 @@ int main(int argc, char** argv) {
         CascadeClassifier faceCascade;
         
         if (!faceCascade.load(cascadePath)) {
-            cerr << "錯誤：無法載入模型 " << cascadePath << endl;
+            cerr << "Error: cannot load model " << cascadePath << endl;
             return -1;
         }
-        cout << "載入模型: " << cascadePath << " 成功" << endl;
-        
+        cout << "load model: " << cascadePath << " success" << endl;
+
         // 2. 載入 LBPH 人臉辨識模型
         string modelPath = "lbph_model.yml";
         Ptr<LBPHFaceRecognizer> recognizer = LBPHFaceRecognizer::create();
         
         try {
             recognizer->read(modelPath);
-            cout << "載入模型: " << modelPath << " 成功" << endl;
+            cout << "load model: " << modelPath << " success" << endl;
         } catch (Exception& e) {
-            cerr << "錯誤：無法載入模型 " << modelPath << endl;
-            cerr << "詳細資訊: " << e.what() << endl;
+            cerr << "Error: cannot load model " << modelPath << endl;
+            cerr << "Details: " << e.what() << endl;
             return -1;
         }
         
@@ -208,16 +197,16 @@ int main(int argc, char** argv) {
         VideoCapture camera(2);
         
         if (!camera.isOpened()) {
-            cerr << "錯誤：無法開啟攝影機" << endl;
+            cerr << "Error: cannot open camera" << endl;
             return -1;
         }
-        cout << "開啟攝影機: 成功" << endl;
+        cout << "open camera: success" << endl;
 
         // 建立 ID 對應表
         map<int, string> idToStudentId = createIdToStudentIdMap();
         
         // 效能優化參數
-        const Size TARGET_SIZE(640, 480);  // 使用攝影機原始大小，不拉伸
+        const Size TARGET_SIZE(fb.getWidth(), fb.getHeight());
         const int FRAME_SKIP = 2;
         const double CONFIDENCE_THRESHOLD = 100.0;
         
@@ -225,7 +214,7 @@ int main(int argc, char** argv) {
         vector<Rect> lastFaces;
         vector<string> lastLabels;
 
-        cout << "\n系統啟動，按 Ctrl+C 退出...\n" << endl;
+        cout << "\nsystem started, press Ctrl+C to exit...\n" << endl;
 
         // === 主迴圈 ===
         while (running) {
@@ -234,11 +223,10 @@ int main(int argc, char** argv) {
             
             camera >> frame;
             if (frame.empty()) {
-                cerr << "警告：無法讀取影像" << endl;
+                cerr << "Warning: cannot read frame" << endl;
                 break;
             }
             
-            // 調整為固定大小但保持比例
             resize(frame, resizedFrame, TARGET_SIZE);
             cvtColor(resizedFrame, grayFrame, COLOR_BGR2GRAY);
             
@@ -327,10 +315,10 @@ int main(int argc, char** argv) {
         
         // 釋放資源
         camera.release();
-        cout << "釋放資源，程式結束。" << endl;
+        cout << "release resources, program ended." << endl;
         
     } catch (const exception& e) {
-        cerr << "錯誤: " << e.what() << endl;
+        cerr << "Error: " << e.what() << endl;
         return -1;
     }
 
