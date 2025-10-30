@@ -3,27 +3,12 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <filesystem>
 #include <algorithm>
-#include <dirent.h>
-#include <sys/stat.h>
 
+namespace fs = std::filesystem;
 using namespace cv;
 using namespace std;
-
-// 檢查路徑是否為目錄
-bool isDirectory(const string& path) {
-    struct stat statbuf;
-    if (stat(path.c_str(), &statbuf) != 0)
-        return false;
-    return S_ISDIR(statbuf.st_mode);
-}
-
-// 檢查檔案是否為圖片格式
-bool isImageFile(const string& filename) {
-    string ext = filename.substr(filename.find_last_of(".") + 1);
-    transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    return (ext == "jpg" || ext == "jpeg" || ext == "png" || ext == "bmp");
-}
 
 // 從單張圖片中偵測並裁切最大的人臉
 bool detectAndCropFace(const Mat& image, const CascadeClassifier& faceCascade, Mat& faceROI) {
@@ -56,9 +41,8 @@ bool detectAndCropFace(const Mat& image, const CascadeClassifier& faceCascade, M
 bool scanDataset(const string& datasetPath, const CascadeClassifier& faceCascade,
                  vector<Mat>& faces, vector<int>& labels) {
     
-    DIR* dir = opendir(datasetPath.c_str());
-    if (!dir) {
-        cerr << "錯誤：無法開啟資料集目錄: " << datasetPath << endl;
+    if (!fs::exists(datasetPath) || !fs::is_directory(datasetPath)) {
+        cerr << "錯誤：資料集路徑無效或不存在: " << datasetPath << endl;
         return false;
     }
     
@@ -69,46 +53,33 @@ bool scanDataset(const string& datasetPath, const CascadeClassifier& faceCascade
     cout << "開始掃描資料集目錄: " << datasetPath << endl;
     cout << "=====================================" << endl;
     
-    struct dirent* entry;
-    vector<string> userDirs;
-    
-    // 收集所有使用者目錄
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue; // 跳過隱藏檔案和 . ..
-        
-        string userPath = datasetPath + "/" + entry->d_name;
-        if (isDirectory(userPath)) {
-            userDirs.push_back(entry->d_name);
+    // 遍歷所有使用者子目錄
+    for (const auto& userDir : fs::directory_iterator(datasetPath)) {
+        if (!userDir.is_directory()) {
+            continue;
         }
-    }
-    closedir(dir);
-    
-    // 按照字典序排序以確保一致性
-    sort(userDirs.begin(), userDirs.end());
-    
-    // 遍歷所有使用者目錄
-    for (const string& userName : userDirs) {
-        string userPath = datasetPath + "/" + userName;
         
+        string userName = userDir.path().filename().string();
         cout << "\n處理使用者 [" << userName << "] (ID: " << userId << ")" << endl;
         
         int userImageCount = 0;
         int userSuccessCount = 0;
         
-        DIR* userDir = opendir(userPath.c_str());
-        if (!userDir) {
-            cout << "  警告：無法開啟目錄 " << userPath << endl;
-            continue;
-        }
-        
         // 遍歷該使用者的所有圖片
-        while ((entry = readdir(userDir)) != NULL) {
-            if (entry->d_name[0] == '.') continue;
+        for (const auto& imageFile : fs::directory_iterator(userDir.path())) {
+            if (!imageFile.is_regular_file()) {
+                continue;
+            }
             
-            string filename = entry->d_name;
-            if (!isImageFile(filename)) continue;
+            string imagePath = imageFile.path().string();
+            string extension = imageFile.path().extension().string();
             
-            string imagePath = userPath + "/" + filename;
+            // 檢查是否為圖片檔案
+            transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+            if (extension != ".jpg" && extension != ".jpeg" && 
+                extension != ".png" && extension != ".bmp") {
+                continue;
+            }
             
             totalImages++;
             userImageCount++;
@@ -116,14 +87,14 @@ bool scanDataset(const string& datasetPath, const CascadeClassifier& faceCascade
             // 讀取圖片
             Mat image = imread(imagePath);
             if (image.empty()) {
-                cout << "  警告：無法讀取圖片 " << filename << endl;
+                cout << "  警告：無法讀取圖片 " << imagePath << endl;
                 continue;
             }
             
             // 偵測並裁切人臉
             Mat faceROI;
             if (!detectAndCropFace(image, faceCascade, faceROI)) {
-                cout << "  警告：未偵測到人臉 - " << filename << endl;
+                cout << "  警告：未偵測到人臉 - " << imageFile.path().filename().string() << endl;
                 continue;
             }
             
@@ -133,7 +104,8 @@ bool scanDataset(const string& datasetPath, const CascadeClassifier& faceCascade
             vector<Rect> faces_check;
             faceCascade.detectMultiScale(gray, faces_check, 1.1, 4, 0, Size(30, 30));
             if (faces_check.size() > 1) {
-                cout << "  警告：偵測到多張人臉，使用最大的 - " << filename << endl;
+                cout << "  警告：偵測到多張人臉，使用最大的 - " 
+                     << imageFile.path().filename().string() << endl;
             }
             
             // 將人臉數據加入訓練集
@@ -142,8 +114,6 @@ bool scanDataset(const string& datasetPath, const CascadeClassifier& faceCascade
             successfulImages++;
             userSuccessCount++;
         }
-        
-        closedir(userDir);
         
         cout << "  完成：成功處理 " << userSuccessCount << "/" << userImageCount << " 張圖片" << endl;
         userId++;

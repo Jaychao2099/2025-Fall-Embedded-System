@@ -25,10 +25,10 @@ int main(int argc, char** argv) {
     CascadeClassifier faceCascade;
     
     if (!faceCascade.load(cascadePath)) {
-        cerr << "錯誤: 無法載入人臉偵測模型 " << cascadePath << endl;
+        cerr << "Error: cannot load model. " << cascadePath << endl;
         return -1;
     }
-    cout << "✓ 成功載入人臉偵測模型" << endl;
+    cout << "load model: " << cascadePath << " success" << endl;
     
     // 2. 載入 LBPH 人臉辨識模型
     string modelPath = "lbph_model.yml";
@@ -36,10 +36,10 @@ int main(int argc, char** argv) {
     
     try {
         recognizer->read(modelPath);
-        cout << "✓ 成功載入人臉辨識模型" << endl;
+        cout << "load model: " << modelPath << " success" << endl;
     } catch (Exception& e) {
-        cerr << "錯誤: 無法載入人臉辨識模型 " << modelPath << endl;
-        cerr << "詳細資訊: " << e.what() << endl;
+        cerr << "Error: cannot load model. " << modelPath << endl;
+        cerr << "Details: " << e.what() << endl;
         return -1;
     }
     
@@ -47,11 +47,11 @@ int main(int argc, char** argv) {
     VideoCapture camera(2);  // 2 號攝影機
     
     if (!camera.isOpened()) {
-        cerr << "錯誤: 無法開啟攝影機" << endl;
+        cerr << "Error: cannot open camera" << endl;
         return -1;
     }
-    cout << "✓ 成功開啟攝影機" << endl;
-    
+    cout << "open camera: success" << endl;
+
     // 建立 ID 對應表
     map<int, string> idToStudentId = createIdToStudentIdMap();
     
@@ -63,9 +63,9 @@ int main(int argc, char** argv) {
     int frameCount = 0;
     vector<Rect> lastFaces;  // 儲存上一次偵測到的人臉位置
     vector<string> lastLabels;  // 儲存上一次的辨識結果
-    
-    cout << "\n系統已啟動，按 'q' 或 ESC 退出...\n" << endl;
-    
+
+    cout << "\nstart, press 'q' or ESC to exit...\n" << endl;
+
     // === 主迴圈 ===
     while (true) {
         // === FR-1.2: 影像擷取與預處理 ===
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
         // 讀取一幀影像
         camera >> frame;
         if (frame.empty()) {
-            cerr << "警告: 無法讀取影像幀" << endl;
+            cerr << "Warning: cannot read frame" << endl;
             break;
         }
         
@@ -174,12 +174,12 @@ int main(int argc, char** argv) {
         }
         
         // 顯示影像
-        imshow("即時人臉辨識系統 - Real-time Face Recognition", resizedFrame);
+        imshow("Real-time Face Recognition", resizedFrame);
         
         // === FR-1.6: 系統退出 ===
         char key = (char)waitKey(1);
         if (key == 'q' || key == 'Q' || key == 27) {  // 'q' 或 ESC
-            cout << "\n系統正常退出..." << endl;
+            cout << "\nexit system..." << endl;
             break;
         }
         
@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
     // 釋放資源
     camera.release();
     destroyAllWindows();
-    
-    cout << "資源已釋放，程式結束。" << endl;
+
+    cout << "release resources, program ended." << endl;
     return 0;
 }
