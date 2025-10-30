@@ -10,3 +10,5 @@ opencv*/
 ._.DS_Store
 .DS_Store
 Thumbs.db
+*.yml
+*.yaml

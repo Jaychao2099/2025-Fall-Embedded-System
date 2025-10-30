@@ -287,11 +287,18 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < faces.size(); i++) {
                     // 裁切人臉 ROI
                     Mat faceROI = grayFrame(faces[i]);
+
+                    // --- 新增：將人臉 ROI 統一尺寸 ---
+                    // 為了與 Python 訓練程式的行為匹配，這裡也需要 resize。
+                    // 選擇一個合理的尺寸，例如 100x100 或 200x200。
+                    Mat resizedFace;
+                    resize(faceROI, resizedFace, Size(100, 100)); // 尺寸可以自訂，但建議後續訓練也用此尺寸
+                    // --- 修改結束 ---
                     
                     // 進行辨識
                     int predictedLabel = -1;
                     double confidence = 0.0;
-                    recognizer->predict(faceROI, predictedLabel, confidence);
+                    recognizer->predict(resizedFace, predictedLabel, confidence);
                     
                     string name;
                     if (confidence < CONFIDENCE_THRESHOLD && 
