@@ -12,3 +12,11 @@ opencv*/
 Thumbs.db
 *.yml
 *.yaml
+*dataset*
+*dataset/*
+logs/
+logs/*
+*xml
+*.cfg
+*.weights
+*.txt
