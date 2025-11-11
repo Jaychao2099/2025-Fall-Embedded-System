@@ -26,11 +26,12 @@ struct Detection {
 
 // 程式設定參數
 struct Config {
-    string modelConfig = "yolov4-tiny.cfg";      // YOLO 設定檔
-    string modelWeights = "yolov4-tiny.weights"; // YOLO 權重檔
-    int tileSize = 608;                          // 圖塊大小
-    int overlap = 100;                           // 重疊像素
-    float confThreshold = 0.5;                   // 信賴度閾值
+    string modelConfig = "yolov4-tiny-helmet.cfg";           // YOLO 設定檔 
+    string modelWeights = "yolov4-tiny-helmet_best.weights"; // YOLO 權重檔
+    int tileSize = 320;                          // 圖塊大小
+    // int tileSize = 602;                          // 圖塊大小
+    int overlap = 30;                           // 重疊像素
+    float confThreshold = 0.2;                   // 信賴度閾值 0.2
     float nmsThreshold = 0.4;                    // NMS 閾值
     int helmetClassId = 0;                       // 安全帽類別 ID (需根據模型調整)
 };
@@ -88,7 +89,7 @@ vector<Detection> detectOnTile(Net& net, const Mat& tile,
                                const Config& config) {
     // 準備輸入 blob
     Mat blob;
-    blobFromImage(tile, blob, 1/255.0, Size(config.tileSize, config.tileSize), Scalar(), true, false);
+    blobFromImage(tile, blob, 1/255.0, Size(config.tileSize, config.tileSize), Scalar(), false, false);// 第二個 false: 不做 crop
     
     net.setInput(blob);
     
@@ -116,10 +117,10 @@ vector<Detection> detectWithTiling(Net& net, const Mat& image,
     int totalTiles = ((imgHeight - config.overlap) / stride + 1) * 
                      ((imgWidth - config.overlap) / stride + 1);
     
-    cout << "開始分塊處理，圖片尺寸: " << imgWidth << "x" << imgHeight << endl;
-    cout << "圖塊尺寸: " << config.tileSize << "x" << config.tileSize 
-         << ", 重疊: " << config.overlap << "px" << endl;
-    cout << "預計處理圖塊數: " << totalTiles << endl;
+    cout << "start handling tiles, image size: " << imgWidth << "x" << imgHeight << endl;
+    cout << "tile size: " << config.tileSize << "x" << config.tileSize 
+         << ", overlap: " << config.overlap << "px" << endl;
+    cout << "estimated number of tiles to process: " << totalTiles << endl;
     
     // 雙層迴圈：滑動窗口遍歷整張圖
     for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
@@ -141,48 +142,50 @@ vector<Detection> detectWithTiling(Net& net, const Mat& image,
             }
             
             // 進度顯示
+            // cout << "processing progress: " << tileCount << "/" << totalTiles 
+            //      << " (" << (tileCount * 100 / totalTiles) << "%)" << endl;
             if (tileCount % 10 == 0 || tileCount == totalTiles) {
-                cout << "處理進度: " << tileCount << "/" << totalTiles 
+                cout << "processing progress: " << tileCount << "/" << totalTiles 
                      << " (" << (tileCount * 100 / totalTiles) << "%)" << endl;
             }
         }
     }
     
-    // 處理邊界（如果圖片尺寸不是 stride 的整數倍）
-    // 右邊界
-    if (imgWidth % stride != 0) {
-        int x = imgWidth - config.tileSize;
-        for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
-            Rect tileRect(x, y, config.tileSize, config.tileSize);
-            Mat tile = image(tileRect);
-            vector<Detection> tileDetections = detectOnTile(net, tile, config);
+    // // 處理邊界（如果圖片尺寸不是 stride 的整數倍）
+    // // 右邊界
+    // if (imgWidth % stride != 0) {
+    //     int x = imgWidth - config.tileSize;
+    //     for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
+    //         Rect tileRect(x, y, config.tileSize, config.tileSize);
+    //         Mat tile = image(tileRect);
+    //         vector<Detection> tileDetections = detectOnTile(net, tile, config);
             
-            for (auto& det : tileDetections) {
-                det.box.x += x;
-                det.box.y += y;
-                allDetections.push_back(det);
-            }
-        }
-    }
+    //         for (auto& det : tileDetections) {
+    //             det.box.x += x;
+    //             det.box.y += y;
+    //             allDetections.push_back(det);
+    //         }
+    //     }
+    // }
     
-    // 下邊界
-    if (imgHeight % stride != 0) {
-        int y = imgHeight - config.tileSize;
-        for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
-            Rect tileRect(x, y, config.tileSize, config.tileSize);
-            Mat tile = image(tileRect);
-            vector<Detection> tileDetections = detectOnTile(net, tile, config);
+    // // 下邊界
+    // if (imgHeight % stride != 0) {
+    //     int y = imgHeight - config.tileSize;
+    //     for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
+    //         Rect tileRect(x, y, config.tileSize, config.tileSize);
+    //         Mat tile = image(tileRect);
+    //         vector<Detection> tileDetections = detectOnTile(net, tile, config);
             
-            for (auto& det : tileDetections) {
-                det.box.x += x;
-                det.box.y += y;
-                allDetections.push_back(det);
-            }
-        }
-    }
-    
-    cout << "分塊處理完成，共偵測到 " << allDetections.size() << " 個候選區域" << endl;
-    
+    //         for (auto& det : tileDetections) {
+    //             det.box.x += x;
+    //             det.box.y += y;
+    //             allDetections.push_back(det);
+    //         }
+    //     }
+    // }
+
+    cout << "tile processing completed, detected " << allDetections.size() << " candidate regions" << endl;
+
     return allDetections;
 }
 
@@ -206,9 +209,9 @@ vector<Detection> applyNMS(const vector<Detection>& detections, float nmsThresho
     for (int idx : indices) {
         filteredDetections.push_back(detections[idx]);
     }
-    
-    cout << "NMS 過濾後保留 " << filteredDetections.size() << " 個偵測結果" << endl;
-    
+
+    cout << "NMS filtering retained " << filteredDetections.size() << " detection results" << endl;
+
     return filteredDetections;
 }
 
@@ -239,13 +242,13 @@ void drawDetections(Mat& image, const vector<Detection>& detections) {
 int main(int argc, char** argv) {
     // 參數檢查
     if (argc < 2) {
-        cerr << "用法: " << argv[0] << " <input_image> [output_image]" << endl;
-        cerr << "範例: " << argv[0] << " hidden_test_photo.jpg result.jpg" << endl;
+        cerr << "Usage: " << argv[0] << " <input_image> [output_image]" << endl;
+        cerr << "Example: " << argv[0] << " hidden_test_photo.jpg result.jpg" << endl;
         return -1;
     }
     
     string inputPath = argv[1];
-    string outputPath = (argc >= 3) ? argv[2] : "result.jpg";
+    string outputPath = (argc >= 3) ? argv[2] : "lab3_final_24.jpg";
     
     // 初始化設定
     Config config;
@@ -254,63 +257,56 @@ int main(int argc, char** argv) {
     auto startTime = chrono::high_resolution_clock::now();
     
     cout << "========================================" << endl;
-    cout << "  高解析度安全帽偵測系統" << endl;
+    cout << "  High-Resolution Helmet Detection System" << endl;
     cout << "========================================" << endl;
     
     // 載入 YOLO 模型
-    cout << "\n[步驟 1] 載入 YOLO 模型..." << endl;
+    cout << "\n[Step 1] Loading YOLO model..." << endl;
     Net net;
     try {
         net = readNetFromDarknet(config.modelConfig, config.modelWeights);
         
-        // // 設定運算後端（優先使用 OpenCL 或 CUDA）
-        // if (cuda::getCudaEnabledDeviceCount() > 0) {
-        //     net.setPreferableBackend(DNN_BACKEND_CUDA);
-        //     net.setPreferableTarget(DNN_TARGET_CUDA);
-        //     cout << "使用 CUDA 加速" << endl;
-        // } else {
-            net.setPreferableBackend(DNN_BACKEND_OPENCV);
-            net.setPreferableTarget(DNN_TARGET_CPU);
-            cout << "使用 CPU 運算" << endl;
-        // }
+        net.setPreferableBackend(DNN_BACKEND_OPENCV);
+        net.setPreferableTarget(DNN_TARGET_CPU);
+        cout << "Using CPU backend" << endl;
         
-        cout << "模型載入成功！" << endl;
+        cout << "Model loaded successfully!" << endl;
     } catch (const Exception& e) {
-        cerr << "錯誤: 無法載入 YOLO 模型" << endl;
+        cerr << "Error: Unable to load YOLO model" << endl;
         cerr << e.what() << endl;
         return -1;
     }
     
     // 讀取輸入圖片
-    cout << "\n[步驟 2] 讀取輸入圖片: " << inputPath << endl;
+    cout << "\n[Step 2] Reading input image: " << inputPath << endl;
     Mat image = imread(inputPath);
     
     if (image.empty()) {
-        cerr << "錯誤: 無法讀取圖片檔案 " << inputPath << endl;
+        cerr << "Error: Could not read image file " << inputPath << endl;
         return -1;
     }
     
-    cout << "圖片讀取成功！尺寸: " << image.cols << "x" << image.rows << endl;
+    cout << "Image loaded successfully! Size: " << image.cols << "x" << image.rows << endl;
     
     // 執行分塊偵測
-    cout << "\n[步驟 3] 執行分塊偵測..." << endl;
+    cout << "\n[Step 3] Running tiled detection..." << endl;
     vector<Detection> allDetections = detectWithTiling(net, image, config);
     
     // 應用 NMS 過濾
-    cout << "\n[步驟 4] 應用 NMS 過濾..." << endl;
+    cout << "\n[Step 4] Applying NMS filtering..." << endl;
     vector<Detection> finalDetections = applyNMS(allDetections, config.nmsThreshold);
     
     // 繪製結果
-    cout << "\n[步驟 5] 繪製偵測結果..." << endl;
+    cout << "\n[Step 5] Drawing detections..." << endl;
     Mat resultImage = image.clone();
     drawDetections(resultImage, finalDetections);
     
     // 儲存結果
-    cout << "\n[步驟 6] 儲存結果圖片: " << outputPath << endl;
+    cout << "\n[Step 6] Saving result image: " << outputPath << endl;
     if (imwrite(outputPath, resultImage)) {
-        cout << "結果圖片儲存成功！" << endl;
+        cout << "Result image saved successfully!" << endl;
     } else {
-        cerr << "錯誤: 無法儲存結果圖片" << endl;
+        cerr << "Error: Could not save result image" << endl;
         return -1;
     }
     
@@ -320,13 +316,13 @@ int main(int argc, char** argv) {
     
     // 輸出最終統計
     cout << "\n========================================" << endl;
-    cout << "  偵測完成！" << endl;
+    cout << "  Detection completed!" << endl;
     cout << "========================================" << endl;
-    cout << "偵測到的安全帽數量: " << finalDetections.size() << endl;
-    cout << "總執行時間: " << duration.count() << " 秒" << endl;
+    cout << "Number of helmets detected: " << finalDetections.size() << endl;
+    cout << "Total execution time: " << duration.count() << " seconds" << endl;
     
     if (duration.count() > 1200) {  // 20 分鐘 = 1200 秒
-        cout << "警告: 執行時間超過 20 分鐘限制！" << endl;
+        cout << "Warning: Execution time exceeded 20-minute limit!" << endl;
     }
     
     cout << "========================================" << endl;

@@ -1,0 +1,5 @@
+classes = 1
+train  = /content/darknet/Helmet_Dataset/train.txt
+valid  = /content/darknet/Helmet_Dataset/test.txt
+names = /content/darknet/Helmet_Dataset/obj.names
+backup = /content/darknet/backup/

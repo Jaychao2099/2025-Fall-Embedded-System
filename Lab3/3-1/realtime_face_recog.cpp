@@ -292,7 +292,7 @@ int main(int argc, char** argv) {
                     // 為了與 Python 訓練程式的行為匹配，這裡也需要 resize。
                     // 選擇一個合理的尺寸，例如 100x100 或 200x200。
                     Mat resizedFace;
-                    resize(faceROI, resizedFace, Size(100, 100)); // 尺寸可以自訂，但建議後續訓練也用此尺寸
+                    resize(faceROI, resizedFace, Size(640, 640)); // 尺寸可以自訂，但建議後續訓練也用此尺寸
                     // --- 修改結束 ---
                     
                     // 進行辨識
