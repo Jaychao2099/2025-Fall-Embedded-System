@@ -31,7 +31,7 @@ struct Config {
     string modelWeights = "yolov3-tiny-helmet_best.weights"; // YOLO 權重檔
     int tileSize = 320;                          // 圖塊大小
     int overlap = 32;                            // 重疊像素
-    float confThreshold = 0.2;                   // 信賴度閾值 0.2
+    float confThreshold = 0.2;                   // 信賴度閾值
     float nmsThreshold = 0.3;                    // NMS 閾值
     int helmetClassId = 0;                       // 安全帽類別 ID (需根據模型調整)
 };
@@ -84,116 +84,6 @@ vector<Detection> extractDetections(const vector<Mat>& outputs,
     return detections;
 }
 
-// 對單一圖塊進行偵測
-vector<Detection> detectOnTile(Net& net, const Mat& tile, 
-                               const Config& config,
-                               const vector<String>& outNames) {
-    // 準備輸入 blob
-    Mat blob;
-    blobFromImage(tile, blob, 1/255.0, Size(config.tileSize, config.tileSize), Scalar(), false, false);// 第二個 false: 不做 crop
-    
-    net.setInput(blob);
-    
-    // 前向傳播
-    vector<Mat> outputs;
-    net.forward(outputs, outNames);
-    
-    // 提取偵測結果
-    // 先 extract
-    vector<Detection> tileDetections = extractDetections(outputs, tile.cols, tile.rows, config.confThreshold, config.helmetClassId);
-    // 再做 per-tile NMS，避免把過多候選帶到全域合併
-    vector<Detection> filtered = applyNMS(tileDetections, 0.1, config.nmsThreshold);
-    return filtered;
-}
-
-// 主要的分塊偵測函數
-vector<Detection> detectWithTiling(Net& net, const Mat& image,
-                                   const Config& config,
-                                   const vector<String>& outNames) {
-    vector<Detection> allDetections;
-
-    int imgHeight = image.rows;
-    int imgWidth = image.cols;
-    int stride = config.tileSize - config.overlap;
-
-    // 用一致的公式計算估算 tile 數（上限）
-    int tilesX = (imgWidth <= config.tileSize) ? 1 : ((imgWidth - config.tileSize) / stride + 1);
-    int tilesY = (imgHeight <= config.tileSize) ? 1 : ((imgHeight - config.tileSize) / stride + 1);
-    int totalTiles = tilesX * tilesY;
-
-    cout << "start handling tiles, image size: " << imgWidth << "x" << imgHeight << endl;
-    cout << "tile size: " << config.tileSize << "x" << config.tileSize
-         << ", overlap: " << config.overlap << "px" << endl;
-    cout << "estimated number of tiles to process: " << totalTiles << endl;
-
-    // 預留空間：假設每 tile 平均 3~6 個候選（可視情況調整）
-    const int AVG_CANDIDATES_PER_TILE = 4;
-    allDetections.reserve((size_t)totalTiles * AVG_CANDIDATES_PER_TILE);
-
-    int tileCount = 0;
-    for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
-        for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
-            tileCount++;
-
-            Rect tileRect(x, y, config.tileSize, config.tileSize);
-            Mat tile = image(tileRect); // ROI header, 不會複製像素資料
-
-            // 每個 tile 做偵測（detectOnTile 已包含 per-tile NMS）
-            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
-
-            // 把 tile 的本地座標轉為全圖座標
-            for (auto& det : tileDetections) {
-                det.box.x += x;
-                det.box.y += y;
-            }
-
-            // 使用 move iterator 批次搬入，避免個別 push_back 的複製
-            allDetections.insert(allDetections.end(),
-                                 std::make_move_iterator(tileDetections.begin()),
-                                 std::make_move_iterator(tileDetections.end()));
-            // tileDetections 在此之後會被移動，內容不再可靠
-
-            // 進度顯示：可改頻率減少 I/O
-            if (tileCount % 20 == 0 || tileCount == totalTiles) {
-                cout << "processing progress: " << tileCount << "/" << totalTiles
-                     << " (" << (tileCount * 100 / totalTiles) << "%)" << endl;
-            }
-        }
-    }
-
-    // 處理右邊界與下邊界（如果圖片尺寸不是 stride 的整數倍）
-    // 注意：這裡採用 x 與 y 的邊緣起點，並呼叫 detectOnTile 時傳入 outNames
-    if ((imgWidth - config.tileSize) % stride != 0 && imgWidth > config.tileSize) {
-        int x_edge = imgWidth - config.tileSize;
-        for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
-            Rect tileRect(x_edge, y, config.tileSize, config.tileSize);
-            Mat tile = image(tileRect);
-            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
-            for (auto& det : tileDetections) { det.box.x += x_edge; det.box.y += y; }
-            allDetections.insert(allDetections.end(),
-                                 std::make_move_iterator(tileDetections.begin()),
-                                 std::make_move_iterator(tileDetections.end()));
-        }
-    }
-
-    if ((imgHeight - config.tileSize) % stride != 0 && imgHeight > config.tileSize) {
-        int y_edge = imgHeight - config.tileSize;
-        for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
-            Rect tileRect(x, y_edge, config.tileSize, config.tileSize);
-            Mat tile = image(tileRect);
-            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
-            for (auto& det : tileDetections) { det.box.x += x; det.box.y += y_edge; }
-            allDetections.insert(allDetections.end(),
-                                 std::make_move_iterator(tileDetections.begin()),
-                                 std::make_move_iterator(tileDetections.end()));
-        }
-    }
-
-    cout << "tile processing completed, detected " << allDetections.size() << " candidate regions" << endl;
-
-    return allDetections;
-}
-
 
 // 應用 NMS 過濾重複偵測
 vector<Detection> applyNMS(const vector<Detection>& detections,
@@ -228,6 +118,133 @@ vector<Detection> applyNMS(const vector<Detection>& detections,
     cout << "NMS filtering retained " << filteredDetections.size() << " detection results" << endl;
 
     return filteredDetections;
+}
+
+// 對單一圖塊進行偵測
+vector<Detection> detectOnTile(Net& net, const Mat& tile, 
+                               const Config& config,
+                               const vector<String>& outNames) {
+    // 準備輸入 blob
+    Mat blob;
+    blobFromImage(tile, blob, 1/255.0, Size(config.tileSize, config.tileSize), Scalar(), true, false);// true: 用 RGB, false: 不做 crop
+    
+    net.setInput(blob);
+    
+    // 前向傳播
+    vector<Mat> outputs;
+    net.forward(outputs, outNames);
+    
+    // 提取偵測結果
+    // 先 extract
+    vector<Detection> tileDetections = extractDetections(outputs, tile.cols, tile.rows, config.confThreshold, config.helmetClassId);
+    // 再做 per-tile NMS，避免把過多候選帶到全域合併
+    vector<Detection> filtered = applyNMS(tileDetections, config.confThreshold, config.nmsThreshold);
+    return filtered;
+}
+
+// 主要的分塊偵測函數
+vector<Detection> detectWithTiling(Net& net, const Mat& image,
+                                   const Config& config,
+                                   const vector<String>& outNames) {
+    vector<Detection> allDetections;
+
+    int imgHeight = image.rows;
+    int imgWidth = image.cols;
+    int stride = config.tileSize - config.overlap;
+
+    // 用一致的公式計算估算 tile 數（上限）
+    int tilesX = (imgWidth <= config.tileSize) ? 1 : ((imgWidth - config.tileSize) / stride + 1);
+    int tilesY = (imgHeight <= config.tileSize) ? 1 : ((imgHeight - config.tileSize) / stride + 1);
+    int totalTiles = tilesX * tilesY;
+
+    cout << "start handling tiles, image size: " << imgWidth << "x" << imgHeight << endl;
+    cout << "tile size: " << config.tileSize << "x" << config.tileSize
+         << ", overlap: " << config.overlap << "px" << endl;
+    cout << "estimated number of tiles to process: " << totalTiles << endl;
+
+    // 預留空間：假設每 tile 平均 3~6 個候選（可視情況調整）
+    const int AVG_CANDIDATES_PER_TILE = 4;
+    allDetections.reserve((size_t)totalTiles * AVG_CANDIDATES_PER_TILE);
+
+    // int tileCount = 0;
+    for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
+        for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
+            // tileCount++;
+
+            Rect tileRect(x, y, config.tileSize, config.tileSize);
+            Mat tile = image(tileRect); // ROI header, 不會複製像素資料
+
+            // 每個 tile 做偵測（detectOnTile 已包含 per-tile NMS）
+            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
+
+            // 把 tile 的本地座標轉為全圖座標
+            for (auto& det : tileDetections) {
+                det.box.x += x;
+                det.box.y += y;
+            }
+
+            // 使用 move iterator 批次搬入，避免個別 push_back 的複製
+            allDetections.insert(allDetections.end(),
+                                 std::make_move_iterator(tileDetections.begin()),
+                                 std::make_move_iterator(tileDetections.end()));
+            // tileDetections 在此之後會被移動，內容不再可靠
+
+            // // 進度顯示：可改頻率減少 I/O
+            // if (tileCount % 20 == 0 || tileCount == totalTiles) {
+            //     cout << "processing progress: " << tileCount << "/" << totalTiles
+            //          << " (" << (tileCount * 100 / totalTiles) << "%)" << endl;
+            // }
+        }
+    }
+
+    // 處理右邊界與下邊界（如果圖片尺寸不是 stride 的整數倍）
+    // 注意：這裡採用 x 與 y 的邊緣起點，並呼叫 detectOnTile 時傳入 outNames
+    if ((imgWidth - config.tileSize) % stride != 0 && imgWidth > config.tileSize) {
+        int x_edge = imgWidth - config.tileSize;
+        // 處理右邊界的所有 tile（包含右下角）
+        for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
+            Rect tileRect(x_edge, y, config.tileSize, config.tileSize);
+            Mat tile = image(tileRect);
+
+            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
+            // 座標轉換
+            for (auto& det : tileDetections) {
+                det.box.x += x_edge;
+                det.box.y += y;
+            }
+            allDetections.insert(allDetections.end(),
+                                 std::make_move_iterator(tileDetections.begin()),
+                                 std::make_move_iterator(tileDetections.end()));
+        }
+    }
+
+    // 處理下邊界（如果圖片高度不是 stride 的整數倍）
+    if ((imgHeight - config.tileSize) % stride != 0 && imgHeight > config.tileSize) {
+        int y_edge = imgHeight - config.tileSize;
+        int x_edge = imgWidth - config.tileSize;
+        // 處理下邊界的所有 tile，但排除右下角（已在右邊界處理過）
+        for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
+            // ⭐ 關鍵修正：跳過右下角，避免重複處理
+            if ((imgWidth - config.tileSize) % stride != 0 && x == x_edge) {
+                continue;  // 右下角已在右邊界 loop 處理過
+            }
+            Rect tileRect(x, y_edge, config.tileSize, config.tileSize);
+            Mat tile = image(tileRect);
+            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
+            // 座標轉換
+            for (auto& det : tileDetections) {
+                det.box.x += x;
+                det.box.y += y_edge;
+            }
+            allDetections.insert(allDetections.end(),
+                                 std::make_move_iterator(tileDetections.begin()),
+                                 std::make_move_iterator(tileDetections.end()));
+        }
+    }
+
+    cout << "tile processing completed, detected " << allDetections.size() << " candidate regions" << endl;
+
+    return allDetections;
 }
 
 
