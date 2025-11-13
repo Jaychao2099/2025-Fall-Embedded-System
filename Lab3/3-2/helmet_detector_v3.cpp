@@ -1,9 +1,8 @@
 /*
- * 嵌入式系統專案 LAB 3 - 程式二
- * 高解析度安全帽偵測系統
- * 
- * 功能: 使用 YOLO 模型在高解析度圖片中偵測安全帽
- * 技術: 圖像分塊 + 座標轉換 + NMS 過濾
+ * 多執行緒版本 - 針對 Embedsky E9v3 優化
+ * 新增部分:
+ * 1. ThreadPool 類別
+ * 2. 多執行緒版本的 detectWithTiling()
  */
 
 #include <opencv2/opencv.hpp>
@@ -12,7 +11,13 @@
 #include <vector>
 #include <chrono>
 #include <fstream>
-#include <iterator> // for make_move_iterator
+#include <iterator>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <functional>
+#include <atomic>
 
 using namespace cv;
 using namespace cv::dnn;
@@ -34,6 +39,7 @@ struct Config {
     float confThreshold = 0.2;                   // 信賴度閾值
     float nmsThreshold = 0.3;                    // NMS 閾值
     int helmetClassId = 0;                       // 安全帽類別 ID (需根據模型調整)
+    int numThreads = 3;  // 新增: 執行緒數量 (4核保留1核給系統)
 };
 
 // 從 YOLO 輸出層提取偵測結果
@@ -47,7 +53,7 @@ vector<Detection> extractDetections(const vector<Mat>& outputs,
         
         for (int i = 0; i < output.rows; i++) {
             const float* row = data + i * output.cols;
-            
+
             // YOLO 輸出格式: [center_x, center_y, width, height, objectness, class_scores...]
             float objectness = row[4];
             
@@ -84,7 +90,6 @@ vector<Detection> extractDetections(const vector<Mat>& outputs,
     return detections;
 }
 
-
 // 應用 NMS 過濾重複偵測
 vector<Detection> applyNMS(const vector<Detection>& detections,
                            float scoreThreshold,
@@ -120,139 +125,222 @@ vector<Detection> applyNMS(const vector<Detection>& detections,
     return filteredDetections;
 }
 
-// 對單一圖塊進行偵測
-vector<Detection> detectOnTile(Net& net, const Mat& tile, 
-                               const Config& config,
-                               const vector<String>& outNames) {
+// ============ 新增: Thread Pool 實作 ============
+
+class ThreadPool {
+private:
+    vector<thread> workers;
+    queue<function<void()>> tasks;
+    
+    mutex queueMutex;
+    condition_variable condition;
+    atomic<bool> stop;
+    atomic<int> activeTasks;
+    
+public:
+    ThreadPool(size_t numThreads) : stop(false), activeTasks(0) {
+        for (size_t i = 0; i < numThreads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    function<void()> task;
+                    
+                    {
+                        unique_lock<mutex> lock(this->queueMutex);
+                        this->condition.wait(lock, [this] {
+                            return this->stop || !this->tasks.empty();
+                        });
+                        
+                        if (this->stop && this->tasks.empty()) {
+                            return;
+                        }
+                        
+                        task = move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    
+                    activeTasks++;
+                    task();
+                    activeTasks--;
+                }
+            });
+        }
+    }
+    
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            unique_lock<mutex> lock(queueMutex);
+            if (stop) {
+                throw runtime_error("enqueue on stopped ThreadPool");
+            }
+            tasks.emplace(forward<F>(f));
+        }
+        condition.notify_one();
+    }
+    
+    void wait() {
+        while (true) {
+            unique_lock<mutex> lock(queueMutex);
+            if (tasks.empty() && activeTasks == 0) {
+                break;
+            }
+            lock.unlock();
+            this_thread::sleep_for(chrono::milliseconds(10));
+        }
+    }
+    
+    ~ThreadPool() {
+        {
+            unique_lock<mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+};
+
+// ============ 新增: Tile 任務結構 ============
+
+struct TileTask {
+    int x, y;           // Tile 在原圖中的位置
+    int width, height;  // Tile 尺寸
+};
+
+// ============ 修改: 單個 Tile 的偵測函數 (thread-safe 版本) ============
+
+vector<Detection> detectOnTileSafe(Net& net, const Mat& image, 
+                                   const TileTask& task,
+                                   const Config& config,
+                                   const vector<String>& outNames,
+                                   mutex& netMutex) {
+    // 提取 tile 區域
+    Rect tileRect(task.x, task.y, task.width, task.height);
+    Mat tile = image(tileRect).clone();  // clone() 確保執行緒安全
+    
     // 準備輸入 blob
     Mat blob;
-    blobFromImage(tile, blob, 1/255.0, Size(config.tileSize, config.tileSize), Scalar(), true, false);// true: 用 RGB, false: 不做 crop
+    blobFromImage(tile, blob, 1/255.0, 
+                  Size(config.tileSize, config.tileSize), 
+                  Scalar(), true, false);
     
-    net.setInput(blob);
-    
-    // 前向傳播
+    // 使用 mutex 保護 Net 操作 (Net::forward() 不是 thread-safe)
     vector<Mat> outputs;
-    net.forward(outputs, outNames);
+    {
+        lock_guard<mutex> lock(netMutex);
+        net.setInput(blob);
+        net.forward(outputs, outNames);
+    }
     
     // 提取偵測結果
     // 先 extract
     vector<Detection> tileDetections = extractDetections(outputs, tile.cols, tile.rows, config.confThreshold, config.helmetClassId);
     // 再做 per-tile NMS，避免把過多候選帶到全域合併
     vector<Detection> filtered = applyNMS(tileDetections, config.confThreshold, config.nmsThreshold);
+    
+    // 座標轉換到全圖
+    for (auto& det : filtered) {
+        det.box.x += task.x;
+        det.box.y += task.y;
+    }
+    
     return filtered;
 }
 
-// 主要的分塊偵測函數
-vector<Detection> detectWithTiling(Net& net, const Mat& image,
-                                   const Config& config,
-                                   const vector<String>& outNames) {
-    vector<Detection> allDetections;
+// ============ 新增: 多執行緒版本的 detectWithTiling ============
 
+vector<Detection> detectWithTilingThreaded(Net& net, const Mat& image,
+                                           const Config& config,
+                                           const vector<String>& outNames) {
     int imgHeight = image.rows;
     int imgWidth = image.cols;
     int stride = config.tileSize - config.overlap;
-
-    // 用一致的公式計算估算 tile 數（上限）
-    int tilesX = (imgWidth <= config.tileSize) ? 1 : ((imgWidth - config.tileSize) / stride + 1);
-    int tilesY = (imgHeight <= config.tileSize) ? 1 : ((imgHeight - config.tileSize) / stride + 1);
-    int totalTiles = tilesX * tilesY;
-
-    cout << "start handling tiles, image size: " << imgWidth << "x" << imgHeight << endl;
-    cout << "tile size: " << config.tileSize << "x" << config.tileSize
-         << ", overlap: " << config.overlap << "px" << endl;
-    cout << "estimated number of tiles to process: " << totalTiles << endl;
-
-    // 預留空間：假設每 tile 平均 3~6 個候選（可視情況調整）
-    const int AVG_CANDIDATES_PER_TILE = 4;
-    allDetections.reserve((size_t)totalTiles * AVG_CANDIDATES_PER_TILE);
-
-    // int tileCount = 0;
+    
+    // 計算所有需要處理的 tiles
+    vector<TileTask> tileTasks;
+    
+    // 主要網格區域
     for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
         for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
-            // tileCount++;
-
-            Rect tileRect(x, y, config.tileSize, config.tileSize);
-            Mat tile = image(tileRect); // ROI header, 不會複製像素資料
-
-            // 每個 tile 做偵測（detectOnTile 已包含 per-tile NMS）
-            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
-
-            // 把 tile 的本地座標轉為全圖座標
-            for (auto& det : tileDetections) {
-                det.box.x += x;
-                det.box.y += y;
-            }
-
-            // 使用 move iterator 批次搬入，避免個別 push_back 的複製
-            allDetections.insert(allDetections.end(),
-                                 std::make_move_iterator(tileDetections.begin()),
-                                 std::make_move_iterator(tileDetections.end()));
-            // tileDetections 在此之後會被移動，內容不再可靠
-
-            // // 進度顯示：可改頻率減少 I/O
-            // if (tileCount % 20 == 0 || tileCount == totalTiles) {
-            //     cout << "processing progress: " << tileCount << "/" << totalTiles
-            //          << " (" << (tileCount * 100 / totalTiles) << "%)" << endl;
-            // }
+            tileTasks.push_back({x, y, config.tileSize, config.tileSize});
         }
     }
-
-    // 處理右邊界與下邊界（如果圖片尺寸不是 stride 的整數倍）
-    // 注意：這裡採用 x 與 y 的邊緣起點，並呼叫 detectOnTile 時傳入 outNames
+    
+    // 右邊界
     if ((imgWidth - config.tileSize) % stride != 0 && imgWidth > config.tileSize) {
         int x_edge = imgWidth - config.tileSize;
-        // 處理右邊界的所有 tile（包含右下角）
         for (int y = 0; y <= imgHeight - config.tileSize; y += stride) {
-            Rect tileRect(x_edge, y, config.tileSize, config.tileSize);
-            Mat tile = image(tileRect);
-
-            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
-            // 座標轉換
-            for (auto& det : tileDetections) {
-                det.box.x += x_edge;
-                det.box.y += y;
-            }
-            allDetections.insert(allDetections.end(),
-                                 std::make_move_iterator(tileDetections.begin()),
-                                 std::make_move_iterator(tileDetections.end()));
+            tileTasks.push_back({x_edge, y, config.tileSize, config.tileSize});
         }
     }
-
-    // 處理下邊界（如果圖片高度不是 stride 的整數倍）
+    
+    // 下邊界 (排除右下角)
     if ((imgHeight - config.tileSize) % stride != 0 && imgHeight > config.tileSize) {
         int y_edge = imgHeight - config.tileSize;
         int x_edge = imgWidth - config.tileSize;
         // 處理下邊界的所有 tile，但排除右下角（已在右邊界處理過）
         for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
-            // 關鍵修正：跳過右下角，避免重複處理
             if ((imgWidth - config.tileSize) % stride != 0 && x == x_edge) {
-                continue;  // 右下角已在右邊界 loop 處理過
+                continue;  // 跳過右下角
             }
-            Rect tileRect(x, y_edge, config.tileSize, config.tileSize);
-            Mat tile = image(tileRect);
-            vector<Detection> tileDetections = detectOnTile(net, tile, config, outNames);
-            // 座標轉換
-            for (auto& det : tileDetections) {
-                det.box.x += x;
-                det.box.y += y_edge;
-            }
-            allDetections.insert(allDetections.end(),
-                                 std::make_move_iterator(tileDetections.begin()),
-                                 std::make_move_iterator(tileDetections.end()));
+            tileTasks.push_back({x, y_edge, config.tileSize, config.tileSize});
         }
     }
-
-    cout << "tile processing completed, detected " << allDetections.size() << " candidate regions" << endl;
-
+    
+    cout << "total tiles to process: " << tileTasks.size() << endl;
+    cout << "using " << config.numThreads << " threads" << endl;
+    
+    // 建立 thread pool
+    ThreadPool pool(config.numThreads);
+    
+    // 共享資源
+    vector<Detection> allDetections;
+    mutex detectionsMutex;
+    mutex netMutex;
+    atomic<int> processedTiles(0);
+    
+    // 提交所有 tile 任務
+    for (const auto& task : tileTasks) {
+        pool.enqueue([&, task]() {
+            // 處理單個 tile
+            vector<Detection> tileDetections = detectOnTileSafe(
+                net, image, task, config, outNames, netMutex);
+            
+            // 將結果加入共享容器
+            {
+                lock_guard<mutex> lock(detectionsMutex);
+                allDetections.insert(allDetections.end(),
+                                    make_move_iterator(tileDetections.begin()),
+                                    make_move_iterator(tileDetections.end()));
+            }
+            
+            // 更新進度
+            int completed = ++processedTiles;
+            if (completed % 20 == 0 || completed == (int)tileTasks.size()) {
+                cout << "processing progress: " << completed << "/" 
+                     << tileTasks.size() << " tiles" << endl;
+            }
+        });
+    }
+    
+    // 等待所有任務完成
+    pool.wait();
+    
+    cout << "tile processing completed, detected " 
+         << allDetections.size() << " candidate regions" << endl;
+    
     return allDetections;
 }
 
+// ============ 修改: 繪製函數 ============
 
-// 在圖片上繪製偵測結果
 void drawDetections(Mat& image, const vector<Detection>& detections) {
     for (const auto& det : detections) {
         // 繪製矩形框
-        rectangle(image, det.box, Scalar(0, 255, 0), 2);
+        rectangle(image, det.box, Scalar(0, 255, 0), 5);
         
         // 準備標籤文字
         string label = "Helmet: " + to_string((int)(det.confidence * 100)) + "%";
@@ -272,38 +360,43 @@ void drawDetections(Mat& image, const vector<Detection>& detections) {
     }
 }
 
+// ============ 主程式 ============
+
 int main(int argc, char** argv) {
-    // 參數檢查
     if (argc < 2) {
-        cerr << "Usage: " << argv[0] << " <input_image> [weight]" << endl;
-        cerr << "Example: " << argv[0] << " hidden_test_photo.jpg\tyolov3-tiny-helmet_best.weights" << endl;
+        cerr << "Usage: " << argv[0] << " <input_image> [weight] [num_threads]" << endl;
+        cerr << "Example: " << argv[0] << " hidden_test_photo.jpg yolov3-tiny-helmet_best.weights 3" << endl;
         return -1;
     }
     
     string inputPath = argv[1];
     string outputPath = "lab3_final_24.jpg";
-    // 初始化設定
+
     Config config;
-    if (argc == 3) config.modelWeights = argv[2];
+    if (argc >= 3) config.modelWeights = argv[2];
+    if (argc >= 4) config.numThreads = atoi(argv[3]);
     
-    // 開始計時
+    // 限制執行緒數量 (避免超過硬體核心數)
+    if (config.numThreads > 4) {
+        cout << "WARNING: Thread count limited to 4" << endl;
+        config.numThreads = 4;
+    }
+    
     auto startTime = chrono::high_resolution_clock::now();
     
     cout << "========================================" << endl;
     cout << "  High-Resolution Helmet Detection System" << endl;
     cout << "========================================" << endl;
+    cout << "Thread number: " << config.numThreads << endl;
     
     // 載入 YOLO 模型
     cout << "\n[Step 1] Loading YOLO model..." << endl;
     Net net;
     try {
         net = readNetFromDarknet(config.modelConfig, config.modelWeights);
-        
         net.setPreferableBackend(DNN_BACKEND_OPENCV);
         net.setPreferableTarget(DNN_TARGET_CPU);
         cout << "Using CPU backend" << endl;
-        
-        cout << "Model loaded successfully!" << endl;
     } catch (const Exception& e) {
         cerr << "Error: Unable to load YOLO model" << endl;
         cerr << e.what() << endl;
@@ -324,11 +417,12 @@ int main(int argc, char** argv) {
     // 獲取輸出層名稱
     vector<String> outNames = net.getUnconnectedOutLayersNames();
 
-    // 執行分塊偵測
-    cout << "\n[Step 3] Running tiled detection..." << endl;
-    vector<Detection> allDetections = detectWithTiling(net, image, config, outNames);
+    // 執行多執行緒分塊偵測
+    cout << "\n[Step 3] Running multi-thread tiled detection..." << endl;
+    vector<Detection> allDetections = detectWithTilingThreaded(
+        net, image, config, outNames);
     
-    // 應用 NMS 過濾
+    // 應用全域 NMS 過濾
     cout << "\n[Step 4] Applying NMS filtering..." << endl;
     vector<Detection> finalDetections = applyNMS(allDetections, config.confThreshold, config.nmsThreshold);
     
@@ -357,7 +451,7 @@ int main(int argc, char** argv) {
     cout << "Number of helmets detected: " << finalDetections.size() << endl;
     cout << "Total execution time: " << duration.count() << " seconds" << endl;
     
-    if (duration.count() > 1200) {  // 20 分鐘 = 1200 秒
+    if (duration.count() > 1200) {
         cout << "Warning: Execution time exceeded 20-minute limit!" << endl;
     }
     

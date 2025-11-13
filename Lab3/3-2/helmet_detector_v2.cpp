@@ -47,7 +47,7 @@ vector<Detection> extractDetections(const vector<Mat>& outputs,
         
         for (int i = 0; i < output.rows; i++) {
             const float* row = data + i * output.cols;
-            
+
             // YOLO 輸出格式: [center_x, center_y, width, height, objectness, class_scores...]
             float objectness = row[4];
             
@@ -83,7 +83,6 @@ vector<Detection> extractDetections(const vector<Mat>& outputs,
     
     return detections;
 }
-
 
 // 應用 NMS 過濾重複偵測
 vector<Detection> applyNMS(const vector<Detection>& detections,
@@ -224,7 +223,7 @@ vector<Detection> detectWithTiling(Net& net, const Mat& image,
         int x_edge = imgWidth - config.tileSize;
         // 處理下邊界的所有 tile，但排除右下角（已在右邊界處理過）
         for (int x = 0; x <= imgWidth - config.tileSize; x += stride) {
-            // ⭐ 關鍵修正：跳過右下角，避免重複處理
+            // 關鍵修正：跳過右下角，避免重複處理
             if ((imgWidth - config.tileSize) % stride != 0 && x == x_edge) {
                 continue;  // 右下角已在右邊界 loop 處理過
             }
@@ -252,7 +251,7 @@ vector<Detection> detectWithTiling(Net& net, const Mat& image,
 void drawDetections(Mat& image, const vector<Detection>& detections) {
     for (const auto& det : detections) {
         // 繪製矩形框
-        rectangle(image, det.box, Scalar(0, 255, 0), 2);
+        rectangle(image, det.box, Scalar(0, 255, 0), 5);
         
         // 準備標籤文字
         string label = "Helmet: " + to_string((int)(det.confidence * 100)) + "%";
@@ -275,16 +274,16 @@ void drawDetections(Mat& image, const vector<Detection>& detections) {
 int main(int argc, char** argv) {
     // 參數檢查
     if (argc < 2) {
-        cerr << "Usage: " << argv[0] << " <input_image> [output_image]" << endl;
-        cerr << "Example: " << argv[0] << " hidden_test_photo.jpg result.jpg" << endl;
+        cerr << "Usage: " << argv[0] << " <input_image> [weight]" << endl;
+        cerr << "Example: " << argv[0] << " hidden_test_photo.jpg\tyolov3-tiny-helmet_best.weights" << endl;
         return -1;
     }
     
     string inputPath = argv[1];
-    string outputPath = (argc >= 3) ? argv[2] : "lab3_final_24.jpg";
-    
-    // 初始化設定
+    string outputPath = "lab3_final_24.jpg";
+
     Config config;
+    if (argc >= 3) config.modelWeights = argv[2];
     
     // 開始計時
     auto startTime = chrono::high_resolution_clock::now();
@@ -298,12 +297,9 @@ int main(int argc, char** argv) {
     Net net;
     try {
         net = readNetFromDarknet(config.modelConfig, config.modelWeights);
-        
         net.setPreferableBackend(DNN_BACKEND_OPENCV);
         net.setPreferableTarget(DNN_TARGET_CPU);
         cout << "Using CPU backend" << endl;
-        
-        cout << "Model loaded successfully!" << endl;
     } catch (const Exception& e) {
         cerr << "Error: Unable to load YOLO model" << endl;
         cerr << e.what() << endl;
@@ -357,7 +353,7 @@ int main(int argc, char** argv) {
     cout << "Number of helmets detected: " << finalDetections.size() << endl;
     cout << "Total execution time: " << duration.count() << " seconds" << endl;
     
-    if (duration.count() > 1200) {  // 20 分鐘 = 1200 秒
+    if (duration.count() > 1200) {
         cout << "Warning: Execution time exceeded 20-minute limit!" << endl;
     }
     
