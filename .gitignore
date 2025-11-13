@@ -37,4 +37,6 @@ logs/*
 *.rmvb
 *.mpg
 *.mpeg
-
+*.tar*
+*.zip*
+*.rar*
