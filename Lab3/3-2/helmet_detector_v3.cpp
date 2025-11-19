@@ -306,8 +306,7 @@ vector<Detection> detectWithTilingThreaded(Net& net, const Mat& image,
     for (const auto& task : tileTasks) {
         pool.enqueue([&, task]() {
             // 處理單個 tile
-            vector<Detection> tileDetections = detectOnTileSafe(
-                net, image, task, config, outNames, netMutex);
+            vector<Detection> tileDetections = detectOnTileSafe(net, image, task, config, outNames, netMutex);
             
             // 將結果加入共享容器
             {
@@ -320,8 +319,7 @@ vector<Detection> detectWithTilingThreaded(Net& net, const Mat& image,
             // 更新進度
             int completed = ++processedTiles;
             if (completed % 20 == 0 || completed == (int)tileTasks.size()) {
-                cout << "processing progress: " << completed << "/" 
-                     << tileTasks.size() << " tiles" << endl;
+                cout << "processing progress: " << completed << "/" << tileTasks.size() << " tiles" << endl;
             }
         });
     }
@@ -329,8 +327,7 @@ vector<Detection> detectWithTilingThreaded(Net& net, const Mat& image,
     // 等待所有任務完成
     pool.wait();
     
-    cout << "tile processing completed, detected " 
-         << allDetections.size() << " candidate regions" << endl;
+    cout << "tile processing completed, detected " << allDetections.size() << " candidate regions" << endl;
     
     return allDetections;
 }
@@ -365,7 +362,7 @@ void drawDetections(Mat& image, const vector<Detection>& detections) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         cerr << "Usage: " << argv[0] << " <input_image> [weight] [num_threads]" << endl;
-        cerr << "Example: " << argv[0] << " hidden_test_photo.jpg yolov3-tiny-helmet_best.weights 3" << endl;
+        cerr << "Example: " << argv[0] << " final_demo.jpg yolov3-tiny-helmet_best.weights 3" << endl;
         return -1;
     }
     
@@ -419,8 +416,7 @@ int main(int argc, char** argv) {
 
     // 執行多執行緒分塊偵測
     cout << "\n[Step 3] Running multi-thread tiled detection..." << endl;
-    vector<Detection> allDetections = detectWithTilingThreaded(
-        net, image, config, outNames);
+    vector<Detection> allDetections = detectWithTilingThreaded(net, image, config, outNames);
     
     // 應用全域 NMS 過濾
     cout << "\n[Step 4] Applying NMS filtering..." << endl;
