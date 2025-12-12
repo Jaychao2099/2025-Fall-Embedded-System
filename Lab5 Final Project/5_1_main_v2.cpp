@@ -2,18 +2,17 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <cmath>
+#include <thread> // 新增: 執行緒
+#include <mutex>  // 新增: 互斥鎖
+#include <atomic> // 新增: 原子變數
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <cstring> // for memcpy
+#include <cstring>
 
-// OpenCV Headers
 #include <opencv2/opencv.hpp>
-
-// TNN Headers (請確保你的 Makefile 有指到 include 路徑)
 #include "tnn/core/tnn.h"
 #include "tnn/core/blob.h"
 #include "tnn/utils/mat_utils.h"
@@ -21,33 +20,41 @@
 using namespace std;
 using namespace cv;
 
-// ================= 設定區域 =================
-// 模型路徑 (請確保檔案在板子上)
-const string MODEL_PROTO = "./model/final_224.tnnproto";
-const string MODEL_BIN   = "./model/final_224.tnnmodel";
-
-// YOLOv8 訓練時設定的參數
-const int INPUT_WIDTH = 224;
-const int INPUT_HEIGHT = 224;
-const int NUM_CLASSES = 8; // 題目要求的8類
-const float CONF_THRESHOLD = 0.45; // 信心度門檻
-const float NMS_THRESHOLD = 0.45;  // 重疊過濾門檻
-
-// 顯示設定 (配合你的 Lab3 設定)
-const int DISP_WIDTH = 640;
-const int DISP_HEIGHT = 480;
-
-// 類別名稱
-const vector<string> CLASS_NAMES = {
-    "spoon", "banana", "keyboard", "cell phone", 
-    "book", "scissors", "bottle", "cup"
-};
-
 // ================= 結構定義 =================
 struct Object {
     cv::Rect rect;
     int label;
     float prob;
+};
+
+// ================= 全域變數與鎖 =================
+// 用於保護共享資料的鎖
+std::mutex result_mutex;
+std::mutex frame_mutex;
+
+// 共享資料
+vector<Object> global_objects;     // 最新的偵測結果
+Mat global_frame_for_ai;           // 要給 AI 算的圖片
+bool new_frame_ready = false;      // 告訴 AI 有新圖了
+std::atomic<bool> is_running(true);// 程式是否繼續執行
+
+// ================= 設定區域 =================
+// 模型路徑 (請確保檔案在板子上)
+const string MODEL_PROTO = "./best.opt.tnnproto";
+const string MODEL_BIN   = "./best.opt.tnnmodel";
+// YOLOv8 訓練時設定的參數
+const int INPUT_WIDTH = 224;
+const int INPUT_HEIGHT = 224;
+const int NUM_CLASSES = 8;         // 題目要求的8類
+const float CONF_THRESHOLD = 0.45; // 信心度門檻
+const float NMS_THRESHOLD = 0.45;  // 重疊過濾門檻
+// 顯示設定
+const int DISP_WIDTH = 640;
+const int DISP_HEIGHT = 480;
+// 類別名稱
+const vector<string> CLASS_NAMES = {
+    "spoon", "banana", "keyboard", "cell phone", 
+    "book", "scissors", "bottle", "cup"
 };
 
 // ================= 輔助函式 (NMS 與 後處理) =================
@@ -94,75 +101,211 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
                  vector<Object>& objects, 
                  int frame_w, int frame_h) {
     
-    // 1. 取得輸出 Blob (名稱通常是 output0，如果不確定可用 GetAllOutputBlobs)
+    objects.clear();
+
     tnn::BlobMap output_blobs;
     instance->GetAllOutputBlobs(output_blobs);
     tnn::Blob* output_blob = output_blobs.begin()->second;
-
-    // 2. 取得資料指針
+    
     float* data = (float*)output_blob->GetHandle().base;
-    tnn::BlobShape shape = output_blob->GetBlobDesc().dims;
+    std::vector<int> shape = output_blob->GetBlobDesc().dims;
     
-    // YOLOv8 輸出形狀通常是 [Batch, 4+Classes, Anchors]
-    // 對於 224x224, nc=8: [1, 12, 1029] (1029 = 224/8^2 + ...)
-    int num_channels = shape[1]; // 12 (4個座標 + 8個類別)
-    int num_anchors = shape[2];  // 1029
+    // Debug: 第一次執行時可以打開看 Shape
+    // printf("Shape: %d, %d, %d\n", shape[0], shape[1], shape[2]);
 
-    objects.clear();
-
-    // 3. 遍歷所有 Anchor
-    // 注意：TNN 輸出的記憶體排列可能是連續的，YOLOv8 輸出通常需要轉置讀取
-    // 這裡假設輸出格式為 [1, channels, anchors]，即 data[channel * num_anchors + anchor_idx]
+    // 判斷維度排列：[1, Channels, Anchors] 還是 [1, Anchors, Channels]
+    bool is_channel_first = (shape[1] == (4 + NUM_CLASSES)); 
     
+    int num_anchors = is_channel_first ? shape[2] : shape[1];
+    int num_channels = is_channel_first ? shape[1] : shape[2];
+
     for (int i = 0; i < num_anchors; ++i) {
-        // 找出該 Anchor 中分數最高的類別
         float max_score = 0.0f;
         int max_label = -1;
+        
+        // 取得該 Anchor 的資料指標或偏移量
+        // 如果是 [1, 12, 1029]: data[channel * 1029 + i]
+        // 如果是 [1, 1029, 12]: data[i * 12 + channel]
 
-        // 類別分數從第 4 行開始 (0,1,2,3 是座標)
+        // 1. 先找最大的 Class Score
         for (int c = 0; c < NUM_CLASSES; ++c) {
-            float score = data[(4 + c) * num_anchors + i];
+            float score = 0.0f;
+            if (is_channel_first) {
+                score = data[(4 + c) * num_anchors + i];
+            } else {
+                score = data[i * num_channels + (4 + c)];
+            }
+
             if (score > max_score) {
                 max_score = score;
                 max_label = c;
             }
         }
 
-        // 如果分數夠高，就解析座標
+        // 2. 只有信心度夠高才去算座標 (優化效能)
         if (max_score > CONF_THRESHOLD) {
-            // YOLOv8 輸出是 cx, cy, w, h (相對於 224x224 的數值)
-            float cx = data[0 * num_anchors + i];
-            float cy = data[1 * num_anchors + i];
-            float w  = data[2 * num_anchors + i];
-            float h  = data[3 * num_anchors + i];
+            float cx, cy, w, h;
+            
+            if (is_channel_first) {
+                cx = data[0 * num_anchors + i];
+                cy = data[1 * num_anchors + i];
+                w  = data[2 * num_anchors + i];
+                h  = data[3 * num_anchors + i];
+            } else {
+                cx = data[i * num_channels + 0];
+                cy = data[i * num_channels + 1];
+                w  = data[i * num_channels + 2];
+                h  = data[i * num_channels + 3];
+            }
 
-            // 轉換成左上角座標 (x, y)
+            // --- 關鍵修正：自動判斷座標單位 ---
+            // 如果座標很小 (例如 < 2.0)，代表它是歸一化 (0~1) 的數據
+            // 我們需要把它乘回 224 (INPUT_WIDTH)
+            if (w <= 2.0f && h <= 2.0f) {
+                cx *= INPUT_WIDTH;
+                cy *= INPUT_HEIGHT;
+                w  *= INPUT_WIDTH;
+                h  *= INPUT_HEIGHT;
+            }
+
+            // 轉成左上角座標
             float x = cx - w / 2.0f;
             float y = cy - h / 2.0f;
 
-            // 還原回原始攝影機畫面的比例
-            // 因為模型輸入是 224x224，但畫面顯示可能是 640x480
-            // 這裡我們先存正規化座標，畫圖時再乘回去比較準
-            Object obj;
-            obj.rect = cv::Rect(
-                (int)(x / INPUT_WIDTH * frame_w),
-                (int)(y / INPUT_HEIGHT * frame_h),
-                (int)(w / INPUT_WIDTH * frame_w),
-                (int)(h / INPUT_HEIGHT * frame_h)
-            );
-            obj.label = max_label;
-            obj.prob = max_score;
-            objects.push_back(obj);
+            // 映射到實際螢幕大小 (640x480)
+            int final_x = (int)(x / INPUT_WIDTH * frame_w);
+            int final_y = (int)(y / INPUT_HEIGHT * frame_h);
+            int final_w = (int)(w / INPUT_WIDTH * frame_w);
+            int final_h = (int)(h / INPUT_HEIGHT * frame_h);
+
+            // --- 安全性檢查：防止框框畫出界 ---
+            final_x = max(0, min(final_x, frame_w - 1));
+            final_y = max(0, min(final_y, frame_h - 1));
+            final_w = min(final_w, frame_w - final_x);
+            final_h = min(final_h, frame_h - final_y);
+            
+            if (final_w > 0 && final_h > 0) {
+                Object obj;
+                obj.rect = cv::Rect(final_x, final_y, final_w, final_h);
+                obj.label = max_label;
+                obj.prob = max_score;
+                objects.push_back(obj);
+            }
         }
     }
 
-    // 4. NMS 過濾
     nms(objects, NMS_THRESHOLD);
 }
 
-// ================= 主程式 =================
+// ================= AI 工作執行緒 =================
+void ai_worker_thread() {
+    // 1. 在執行緒內部初始化 TNN (每個執行緒獨立的 Instance 比較安全)
+    // cout << "[AI Thread] Init TNN..." << endl;
+    
+    // 讀取 Proto (網路結構)
+    string proto_content;
+    {
+        ifstream proto_file(MODEL_PROTO);
+        if (!proto_file.is_open()) { cerr << "Proto file not found!" << endl; return; }
+        proto_content = string((istreambuf_iterator<char>(proto_file)), istreambuf_iterator<char>());
+    }
+
+    // 讀取 Model (權重)
+    string model_content;
+    {
+        ifstream model_file(MODEL_BIN, ios::binary);
+        if (!model_file.is_open()) { cerr << "Model file not found!" << endl; return; }
+        model_content = string((istreambuf_iterator<char>(model_file)), istreambuf_iterator<char>());
+    }
+
+    tnn::ModelConfig model_config;
+    model_config.model_type = tnn::MODEL_TYPE_TNN;
+    model_config.params = {proto_content, model_content};
+
+    tnn::TNN tnn_net;
+    tnn_net.Init(model_config);
+
+    // 建立推論實例 (Instance)
+    tnn::NetworkConfig network_config;
+    network_config.device_type = tnn::DEVICE_ARM; // E9V3 是 ARM 架構
+    network_config.enable_tune_kernel = true;     // 關閉 = 加速用啟用
+    tnn::Status status;
+    auto instance = tnn_net.CreateInst(network_config, status);
+
+    if (status != tnn::TNN_OK) {
+        cerr << "[AI Thread] Init failed!" << endl;
+        return;
+    }
+    
+    // cout << "[AI Thread] Ready loop." << endl;
+
+    Mat input_mat;
+    vector<Object> local_objects;
+
+    while (is_running) {
+        // 2. 檢查有沒有新圖片
+        bool has_job = false;
+        {
+            lock_guard<mutex> lock(frame_mutex);
+            if (new_frame_ready) {
+                // 複製圖片過來，避免主執行緒修改
+                input_mat = global_frame_for_ai.clone(); 
+                new_frame_ready = false; // 標記已取走
+                has_job = true;
+            }
+        }
+
+        if (!has_job) {
+            // 如果沒工作，稍微休息一下避免佔用 CPU 資源
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // 3. 開始推論 (這裡會花 0.8s，但不會卡住主畫面)
+        Mat input_blob_mat;
+        resize(input_mat, input_blob_mat, Size(INPUT_WIDTH, INPUT_HEIGHT));
+        cvtColor(input_blob_mat, input_blob_mat, COLOR_BGR2RGB);
+
+        // 設定輸入
+        // 使用 TNN 提供的工具將 OpenCV Mat 轉成 TNN Blob
+        // 注意：這裡假設 input_blob_mat 是連續記憶體
+        // 誠實告訴 TNN，傳進來的資料是 {1, 224, 224, 3} (Height, Width, Channel)
+        // TNN 的 SetInputMat 會自動幫你把 HWC [224, 224, 3] 轉成模型需要的 NCHW [1, 3, 224, 224]
+        std::shared_ptr<tnn::Mat> tnn_mat = std::make_shared<tnn::Mat>(
+            tnn::DEVICE_ARM,
+            tnn::N8UC3, 
+            std::vector<int>{1, INPUT_HEIGHT, INPUT_WIDTH, 3}, // <--- 關鍵修改
+            input_blob_mat.data
+        );
+
+        // instance->SetInputMat(tnn_mat, tnn::MatConvertParam());
+        // 設定歸一化參數：(x - mean) * scale
+        // YOLO 通常不需要 mean，但需要 scale 壓縮到 0~1
+        tnn::MatConvertParam input_cvt_param;
+        input_cvt_param.scale = {1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0};
+        input_cvt_param.bias = {0.0, 0.0, 0.0};
+
+        instance->SetInputMat(tnn_mat, input_cvt_param);
+        
+        // 推論
+        instance->Forward();
+
+        // 後處理
+        // 注意：這裡傳入的是原始圖片的大小 (input_mat.cols)，不是 224
+        postProcess(instance, local_objects, input_mat.cols, input_mat.rows);
+
+        // 4. 更新全域結果
+        {
+            lock_guard<mutex> lock(result_mutex);
+            global_objects = local_objects; // 把算好的框框丟出去
+        }
+        // cout << "[AI Thread] Updated objects: " << local_objects.size() << endl;
+    }
+}
+
+// ================= 主程式 (顯示緒) =================
 int main() {
-    // ------------------- 1. Framebuffer 初始化 (同 Lab3) -------------------
+    // Framebuffer Init
     int fb = open("/dev/fb0", O_RDWR);
     if (fb < 0) {
         cerr << "Error: Cannot open /dev/fb0" << endl;
@@ -180,161 +323,95 @@ int main() {
     int height = vinfo.yres;
     int bpp = vinfo.bits_per_pixel;
     int screensize = width * height * bpp / 8;
-    
+
     unsigned char* fbp = (unsigned char*)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
     if ((intptr_t)fbp == -1) {
         cerr << "Error: mmap failed" << endl;
         close(fb);
         return -1;
     }
-    
-    cout << "Framebuffer Init OK: " << width << "x" << height << " " << bpp << "bpp" << endl;
 
-    // ------------------- 2. TNN 模型初始化 -------------------
-    cout << "Loading TNN Model..." << endl;
-    
-    // 讀取 Proto (網路結構)
-    string proto_content;
-    {
-        ifstream proto_file(MODEL_PROTO);
-        if (!proto_file.is_open()) { cerr << "Proto file not found!" << endl; return -1; }
-        proto_content = string((istreambuf_iterator<char>(proto_file)), istreambuf_iterator<char>());
-    }
-
-    // 讀取 Model (權重)
-    string model_content;
-    {
-        ifstream model_file(MODEL_BIN, ios::binary);
-        if (!model_file.is_open()) { cerr << "Model file not found!" << endl; return -1; }
-        model_content = string((istreambuf_iterator<char>(model_file)), istreambuf_iterator<char>());
-    }
-
-    tnn::ModelConfig model_config;
-    model_config.model_type = tnn::MODEL_TYPE_TNN;
-    model_config.params = {proto_content, model_content};
-
-    tnn::TNN tnn_net;
-    tnn::Status status = tnn_net.Init(model_config);
-    if (status != tnn::TNN_OK) {
-        cerr << "TNN Init failed: " << status.description().c_str() << endl;
-        return -1;
-    }
-
-    // 建立推論實例 (Instance)
-    tnn::NetworkConfig network_config;
-    network_config.device_type = tnn::DEVICE_ARM; // E9V3 是 ARM 架構
-    network_config.enable_tune_kernel = true;    // 加速用，暫時關閉
-    
-    auto instance = tnn_net.CreateInst(network_config, status);
-    if (status != tnn::TNN_OK || !instance) {
-        cerr << "CreateInst failed: " << status.description().c_str() << endl;
-        return -1;
-    }
-    
-    cout << "TNN Model Loaded Successfully!" << endl;
-
-    // ------------------- 3. 攝影機初始化 -------------------
-    VideoCapture cap(2); // 根據 Lab3 經驗，確認是 index 2
+    // Camera Init
+    VideoCapture cap(2);
     if (!cap.isOpened()) {
         cerr << "Error: Cannot open camera 2" << endl;
         return -1;
     }
-    // 嘗試設定解析度以提高讀取速度 (可選)
-    // cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    // cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 
-    Mat frame, input_blob_mat, display_frame;
-    vector<Object> detected_objects;
+    // 啟動 AI 執行緒
+    thread ai_thread(ai_worker_thread); // <--- 這裡啟動分身
 
-    cout << "Starting Loop. Press Ctrl+C to stop." << endl;
+    Mat frame, display_frame;
+    vector<Object> current_objects_to_draw;
+
+    // cout << "Main loop started..." << endl;
 
     while (true) {
-        // --- A. 讀取影像 ---
+        // 1. 讀取畫面 (快速)
         cap >> frame;
         if (frame.empty()) break;
 
-        // --- B. TNN 預處理 ---
-        // 1. Resize 到 224x224
-        resize(frame, input_blob_mat, Size(INPUT_WIDTH, INPUT_HEIGHT));
-        
-        // 2. 轉換格式 (OpenCV BGR -> TNN RGB)
-        // TNN MatUtils 可以做，或者我們手動轉
-        cvtColor(input_blob_mat, input_blob_mat, COLOR_BGR2RGB);
-
-        // 3. 設定輸入 Blob
-        auto input_blob = instance->GetInputBlob(instance->GetAllInputBlobs().begin()->second->GetBlobDesc().name);
-        
-        // 將 Mat 資料塞入 TNN 輸入
-        tnn::MatConvertParam input_cvt_param;
-        // 這裡不需要 scale/bias，因為 YOLOv8 模型內部通常已經含有了，或者在 Export 時處理
-        // 如果偵測效果很差，可能需要加上 normalization: scale = 1/255.0
-        // input_cvt_param.scale = {1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0}; 
-        
-        // 使用 TNN 提供的工具將 OpenCV Mat 轉成 TNN Blob
-        // 注意：這裡假設 input_blob_mat 是連續記憶體
-        std::shared_ptr<tnn::Mat> tnn_mat = std::make_shared<tnn::Mat>(
-            tnn::DEVICE_ARM, 
-            tnn::N8UC3, 
-            std::vector<int>{1, 3, INPUT_HEIGHT, INPUT_WIDTH}, 
-            input_blob_mat.data
-        );
-        
-        status = instance->SetInputMat(tnn_mat, input_cvt_param);
-        if (status != tnn::TNN_OK) {
-            cerr << "SetInputMat Error: " << status.description().c_str() << endl;
-            continue;
+        // 2. 傳送圖片給 AI (如果有空閒)
+        {
+            // 使用 try_lock 或者直接 lock，因為這裡很快
+            lock_guard<mutex> lock(frame_mutex);
+            if (!new_frame_ready) { // 如果 AI 還沒拿走上一張，我們就不要覆蓋 (或者你想覆蓋也可以)
+                // 這裡選擇：如果 AI 正在忙，我們就更新成最新的圖，讓他一忙完就拿到最新的
+                global_frame_for_ai = frame.clone(); // 必須 clone
+                new_frame_ready = true;
+            }
         }
 
-        // --- C. 執行推論 ---
-        status = instance->Forward();
-        if (status != tnn::TNN_OK) {
-            cerr << "Forward Error: " << status.description().c_str() << endl;
-            continue;
+        // 3. 取得目前最新的偵測結果
+        {
+            lock_guard<mutex> lock(result_mutex);
+            current_objects_to_draw = global_objects; // 複製一份拿來畫
         }
 
-        // --- D. 後處理 (解析 + NMS) ---
-        postProcess(instance, detected_objects, frame.cols, frame.rows);
-
-        // --- E. 畫圖 (Visualization) ---
-        for (const auto& obj : detected_objects) {
-            // 畫框
+        // 4. 畫圖 (畫在目前的 frame 上)
+        // 注意：因為 frame 是新的，但 box 可能是 0.8 秒前的，
+        // 所以物體移動太快時，框框會有點跟不上 (Lag)，這是正常的物理現象
+        for (const auto& obj : current_objects_to_draw) {
             rectangle(frame, obj.rect, Scalar(0, 255, 0), 2);
             
-            // 畫標籤
+            // 準備文字
             string label = CLASS_NAMES[obj.label] + " " + to_string((int)(obj.prob * 100)) + "%";
             int baseLine;
             Size labelSize = getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
             
-            rectangle(frame, Point(obj.rect.x, obj.rect.y - labelSize.height),
-                      Point(obj.rect.x + labelSize.width, obj.rect.y + baseLine),
+            // 確保文字不會跑出上邊界 (如果 y 太小，就畫在框框裡面)
+            int text_y = obj.rect.y - 5;
+            if (text_y < labelSize.height) {
+                text_y = obj.rect.y + labelSize.height + 5;
+            }
+
+            rectangle(frame, Point(obj.rect.x, text_y - labelSize.height),
+                      Point(obj.rect.x + labelSize.width, text_y + baseLine),
                       Scalar(0, 255, 0), FILLED);
             
-            putText(frame, label, Point(obj.rect.x, obj.rect.y),
+            putText(frame, label, Point(obj.rect.x, text_y),
                     FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 0), 1);
         }
 
-        // --- F. 顯示到 Framebuffer (同 Lab3) ---
+        // 5. 顯示到 Framebuffer
         resize(frame, display_frame, Size(DISP_WIDTH, DISP_HEIGHT));
-        
         // 關鍵：轉成 BGR565 (嵌入式螢幕常用格式)
         cvtColor(display_frame, display_frame, COLOR_BGR2BGR565);
-
+        
         // 寫入 mmap 記憶體
         // 假設是全螢幕左上角顯示
         for (int y = 0; y < DISP_HEIGHT; y++) {
-            // 計算 framebuffer 的偏移量
-            // Lab3 範例: (DISP_Y + y) * width + DISP_X
-            long int location = (y * width) * 2; 
-            
-            // 複製一行 pixels
-            memcpy(fbp + location, display_frame.ptr(y), DISP_WIDTH * 2);
+            memcpy(fbp + ((0 + y) * width + 0) * 2, display_frame.ptr(y), DISP_WIDTH * 2);
         }
-        
-        // 簡單的時間控制，避免吃滿 CPU
-        // waitKey 在這裡沒有視窗效果，但可以稍微 delay
-        // cv::waitKey(1); 
+
+        // 6. 離開檢查
+        // int key = waitKey(1); 
+        // if (key == 27) { is_running = false; break; }
     }
 
+    is_running = false;
+    ai_thread.join(); // 等待 AI 執行緒結束
+    
     // --- 清理 ---
     munmap(fbp, screensize);
     close(fb);

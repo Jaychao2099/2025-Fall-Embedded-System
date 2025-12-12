@@ -23,8 +23,8 @@ using namespace cv;
 
 // ================= 設定區域 =================
 // 模型路徑 (請確保檔案在板子上)
-const string MODEL_PROTO = "./model/final_224.tnnproto";
-const string MODEL_BIN   = "./model/final_224.tnnmodel";
+const string MODEL_PROTO = "./best.opt.tnnproto";
+const string MODEL_BIN   = "./best.opt.tnnmodel";
 
 // YOLOv8 訓練時設定的參數
 const int INPUT_WIDTH = 224;
@@ -223,7 +223,7 @@ int main() {
     // 建立推論實例 (Instance)
     tnn::NetworkConfig network_config;
     network_config.device_type = tnn::DEVICE_ARM; // E9V3 是 ARM 架構
-    network_config.enable_tune_kernel = true;    // 加速用，暫時關閉
+    network_config.enable_tune_kernel = true;    // 關閉 = 加速用啟用
     
     auto instance = tnn_net.CreateInst(network_config, status);
     if (status != tnn::TNN_OK || !instance) {
