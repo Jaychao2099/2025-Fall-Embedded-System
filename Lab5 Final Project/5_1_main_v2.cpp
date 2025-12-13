@@ -95,6 +95,15 @@ void nms(vector<Object>& objects, float threshold) {
         [](const Object& obj) { return obj.prob == 0; }), objects.end());
 }
 
+// 輔助函式：計算 NC4HW4 格式的記憶體偏移量
+// block_size 在 ARM 上通常是 4
+inline int get_nc4hw4_index(int anchor_idx, int channel_idx, int area) {
+    int block = channel_idx / 4;
+    int remain = channel_idx % 4;
+    // 公式：Block偏移 + Anchor偏移 + Channel內偏移
+    return block * (area * 4) + anchor_idx * 4 + remain;
+}
+
 // YOLOv8 後處理核心邏輯
 // 解析 TNN 輸出 Blob -> 轉換為 Object List
 void postProcess(std::shared_ptr<tnn::Instance> instance, 
@@ -102,89 +111,49 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
                  int frame_w, int frame_h) {
     objects.clear();
 
+    // 1. 取得 Raw Output Blob
     tnn::BlobMap output_blobs;
     instance->GetAllOutputBlobs(output_blobs);
-    // 確保有輸出
     if (output_blobs.empty()) return;
 
     tnn::Blob* output_blob = output_blobs.begin()->second;
     float* data = (float*)output_blob->GetHandle().base;
-    std::vector<int> shape = output_blob->GetBlobDesc().dims;
     
-    // // === DEBUG: 檢查輸出維度 ===
-    // // 請在 Terminal 觀察這個輸出，這非常重要！
-    // // 正常應該是: [1, 12, 1029] (Channel First) 或 [1, 1029, 12] (Channel Last)
-    // cout << "Output Shape: [";
-    // for(int d : shape) cout << d << " ";
-    // cout << "]" << endl;
+    // 2. 參數設定
+    int num_anchors  = 1029; // 224x224 (7x7 + 14x14 + 28x28)
+    int num_classes  = 8;
+    int num_channels = 4 + num_classes; // 12
     
-    // YOLOv8 輸出形狀通常是 [1, 4 + 類別數, Anchors]
-    // 也就是 [1, 12, 1029] (針對 224x224 輸入)
-    
-    // 檢查維度 (YOLOv8 導出的 ONNX 幾乎都是 Channel First: [1, Channels, Anchors])
-    int num_channels = shape[1]; // 應該是 4 + 8 = 12
-    int num_anchors  = shape[2]; // 224輸入時約為 1029
-
-    // 安全檢查：如果維度反了，交換一下 (雖然 YOLOv8 原生通常是上面那樣)
-    bool is_transposed = false; 
-    if (num_channels > num_anchors) {
-        swap(num_channels, num_anchors);
-        is_transposed = true; 
-    }
-
-    // 縮放比例：原圖尺寸 / 模型輸入尺寸
+    // 縮放比例
     float scale_x = (float)frame_w / INPUT_WIDTH;
     float scale_y = (float)frame_h / INPUT_HEIGHT;
 
     for (int i = 0; i < num_anchors; ++i) {
-        // 1. 找出這個 Anchor 中分數最高的類別
-        // YOLOv8 的輸出排列：
-        // Channel 0: cx
-        // Channel 1: cy
-        // Channel 2: w
-        // Channel 3: h
-        // Channel 4~11: class scores
-        
         float max_score = 0.0f;
         int max_label = -1;
 
-        int debug_c;
-
-        // 優化：直接從 Channel 4 開始掃描類別分數
-        for (int c = 0; c < NUM_CLASSES; ++c) {
-            float score = 0.0f;
-            if (!is_transposed) {
-                // data[channel * stride + i]
-                score = data[(4 + c) * num_anchors + i];
-            } else {
-                score = data[i * num_channels + (4 + c)];
-            }
-
+        // 3. 讀取類別分數 (從 Channel 4 開始)
+        for (int c = 0; c < num_classes; ++c) {
+            // 使用 NC4HW4 公式取得正確位置
+            int raw_index = get_nc4hw4_index(i, 4 + c, num_anchors);
+            float score = data[raw_index];
+            
             if (score > max_score) {
                 max_score = score;
                 max_label = c;
             }
         }
 
-        // 2. 信心度過濾
+        // 4. 信心度過濾
         if (max_score > CONF_THRESHOLD) {
-            float cx, cy, w, h;
-            
-            if (!is_transposed) {
-                cx = data[0 * num_anchors + i];
-                cy = data[1 * num_anchors + i];
-                w  = data[2 * num_anchors + i];
-                h  = data[3 * num_anchors + i];
-            } else {
-                cx = data[i * num_channels + 0];
-                cy = data[i * num_channels + 1];
-                w  = data[i * num_channels + 2];
-                h  = data[i * num_channels + 3];
-            }
+            // 讀取座標 (Channel 0, 1, 2, 3)
+            // 注意：這裡直接用 NC4HW4 公式抓值，絕對準確
+            float cx = data[get_nc4hw4_index(i, 0, num_anchors)];
+            float cy = data[get_nc4hw4_index(i, 1, num_anchors)];
+            float w  = data[get_nc4hw4_index(i, 2, num_anchors)];
+            float h  = data[get_nc4hw4_index(i, 3, num_anchors)];
 
-            // --- 修正：YOLOv8 默認輸出就是 0~224 的像素座標 ---
-            // 直接轉回原圖尺寸
-            // 左上角座標 x = cx - w/2
+            // 轉回原圖座標
             float x = (cx - w * 0.5f) * scale_x;
             float y = (cy - h * 0.5f) * scale_y;
             float width = w * scale_x;
@@ -195,17 +164,6 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
             int y1 = max(0, min((int)y, frame_h - 1));
             int w1 = min((int)width, frame_w - x1);
             int h1 = min((int)height, frame_h - y1);
-
-            // // ================= DEBUG 訊息開始 =================
-            // // 這裡使用 max_label (不是 c) 和 max_score (不是 score)
-            // // 為了不洗版，只印出分數 > 0.5 的 (或是跟上面門檻一致)
-            // cout << "[DEBUG] " 
-            //     << "Class: " << CLASS_NAMES[max_label] 
-            //     << " | Prob: " << fixed << setprecision(2) << max_score 
-            //     << " | Raw(TNN): (" << (int)cx << "," << (int)cy << ")" // 模型直接輸出的中心點
-            //     << " | Screen: [" << x1 << "," << y1 << " " << w1 << "x" << h1 << "]" // 畫在螢幕上的框
-            //     << endl;
-            // // ================= DEBUG 訊息結束 =================
             
             if (w1 > 0 && h1 > 0) {
                 Object obj;
