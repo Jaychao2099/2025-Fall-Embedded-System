@@ -100,37 +100,61 @@ void nms(vector<Object>& objects, float threshold) {
 void postProcess(std::shared_ptr<tnn::Instance> instance, 
                  vector<Object>& objects, 
                  int frame_w, int frame_h) {
-    
     objects.clear();
 
     tnn::BlobMap output_blobs;
     instance->GetAllOutputBlobs(output_blobs);
+    // 確保有輸出
+    if (output_blobs.empty()) return;
+
     tnn::Blob* output_blob = output_blobs.begin()->second;
-    
     float* data = (float*)output_blob->GetHandle().base;
     std::vector<int> shape = output_blob->GetBlobDesc().dims;
     
-    // Debug: 第一次執行時可以打開看 Shape
-    // printf("Shape: %d, %d, %d\n", shape[0], shape[1], shape[2]);
-
-    // 判斷維度排列：[1, Channels, Anchors] 還是 [1, Anchors, Channels]
-    bool is_channel_first = (shape[1] == (4 + NUM_CLASSES)); 
+    // // === DEBUG: 檢查輸出維度 ===
+    // // 請在 Terminal 觀察這個輸出，這非常重要！
+    // // 正常應該是: [1, 12, 1029] (Channel First) 或 [1, 1029, 12] (Channel Last)
+    // cout << "Output Shape: [";
+    // for(int d : shape) cout << d << " ";
+    // cout << "]" << endl;
     
-    int num_anchors = is_channel_first ? shape[2] : shape[1];
-    int num_channels = is_channel_first ? shape[1] : shape[2];
+    // YOLOv8 輸出形狀通常是 [1, 4 + 類別數, Anchors]
+    // 也就是 [1, 12, 1029] (針對 224x224 輸入)
+    
+    // 檢查維度 (YOLOv8 導出的 ONNX 幾乎都是 Channel First: [1, Channels, Anchors])
+    int num_channels = shape[1]; // 應該是 4 + 8 = 12
+    int num_anchors  = shape[2]; // 224輸入時約為 1029
+
+    // 安全檢查：如果維度反了，交換一下 (雖然 YOLOv8 原生通常是上面那樣)
+    bool is_transposed = false; 
+    if (num_channels > num_anchors) {
+        swap(num_channels, num_anchors);
+        is_transposed = true; 
+    }
+
+    // 縮放比例：原圖尺寸 / 模型輸入尺寸
+    float scale_x = (float)frame_w / INPUT_WIDTH;
+    float scale_y = (float)frame_h / INPUT_HEIGHT;
 
     for (int i = 0; i < num_anchors; ++i) {
+        // 1. 找出這個 Anchor 中分數最高的類別
+        // YOLOv8 的輸出排列：
+        // Channel 0: cx
+        // Channel 1: cy
+        // Channel 2: w
+        // Channel 3: h
+        // Channel 4~11: class scores
+        
         float max_score = 0.0f;
         int max_label = -1;
-        
-        // 取得該 Anchor 的資料指標或偏移量
-        // 如果是 [1, 12, 1029]: data[channel * 1029 + i]
-        // 如果是 [1, 1029, 12]: data[i * 12 + channel]
 
-        // 1. 先找最大的 Class Score
+        int debug_c;
+
+        // 優化：直接從 Channel 4 開始掃描類別分數
         for (int c = 0; c < NUM_CLASSES; ++c) {
             float score = 0.0f;
-            if (is_channel_first) {
+            if (!is_transposed) {
+                // data[channel * stride + i]
                 score = data[(4 + c) * num_anchors + i];
             } else {
                 score = data[i * num_channels + (4 + c)];
@@ -142,11 +166,11 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
             }
         }
 
-        // 2. 只有信心度夠高才去算座標 (優化效能)
+        // 2. 信心度過濾
         if (max_score > CONF_THRESHOLD) {
             float cx, cy, w, h;
             
-            if (is_channel_first) {
+            if (!is_transposed) {
                 cx = data[0 * num_anchors + i];
                 cy = data[1 * num_anchors + i];
                 w  = data[2 * num_anchors + i];
@@ -158,35 +182,34 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
                 h  = data[i * num_channels + 3];
             }
 
-            // --- 關鍵修正：自動判斷座標單位 ---
-            // 如果座標很小 (例如 < 2.0)，代表它是歸一化 (0~1) 的數據
-            // 我們需要把它乘回 224 (INPUT_WIDTH)
-            if (w <= 2.0f && h <= 2.0f) {
-                cx *= INPUT_WIDTH;
-                cy *= INPUT_HEIGHT;
-                w  *= INPUT_WIDTH;
-                h  *= INPUT_HEIGHT;
-            }
+            // --- 修正：YOLOv8 默認輸出就是 0~224 的像素座標 ---
+            // 直接轉回原圖尺寸
+            // 左上角座標 x = cx - w/2
+            float x = (cx - w * 0.5f) * scale_x;
+            float y = (cy - h * 0.5f) * scale_y;
+            float width = w * scale_x;
+            float height = h * scale_y;
 
-            // 轉成左上角座標
-            float x = cx - w / 2.0f;
-            float y = cy - h / 2.0f;
+            // 邊界檢查
+            int x1 = max(0, min((int)x, frame_w - 1));
+            int y1 = max(0, min((int)y, frame_h - 1));
+            int w1 = min((int)width, frame_w - x1);
+            int h1 = min((int)height, frame_h - y1);
 
-            // 映射到實際螢幕大小 (640x480)
-            int final_x = (int)(x / INPUT_WIDTH * frame_w);
-            int final_y = (int)(y / INPUT_HEIGHT * frame_h);
-            int final_w = (int)(w / INPUT_WIDTH * frame_w);
-            int final_h = (int)(h / INPUT_HEIGHT * frame_h);
-
-            // --- 安全性檢查：防止框框畫出界 ---
-            final_x = max(0, min(final_x, frame_w - 1));
-            final_y = max(0, min(final_y, frame_h - 1));
-            final_w = min(final_w, frame_w - final_x);
-            final_h = min(final_h, frame_h - final_y);
+            // // ================= DEBUG 訊息開始 =================
+            // // 這裡使用 max_label (不是 c) 和 max_score (不是 score)
+            // // 為了不洗版，只印出分數 > 0.5 的 (或是跟上面門檻一致)
+            // cout << "[DEBUG] " 
+            //     << "Class: " << CLASS_NAMES[max_label] 
+            //     << " | Prob: " << fixed << setprecision(2) << max_score 
+            //     << " | Raw(TNN): (" << (int)cx << "," << (int)cy << ")" // 模型直接輸出的中心點
+            //     << " | Screen: [" << x1 << "," << y1 << " " << w1 << "x" << h1 << "]" // 畫在螢幕上的框
+            //     << endl;
+            // // ================= DEBUG 訊息結束 =================
             
-            if (final_w > 0 && final_h > 0) {
+            if (w1 > 0 && h1 > 0) {
                 Object obj;
-                obj.rect = cv::Rect(final_x, final_y, final_w, final_h);
+                obj.rect = cv::Rect(x1, y1, w1, h1);
                 obj.label = max_label;
                 obj.prob = max_score;
                 objects.push_back(obj);
@@ -262,27 +285,31 @@ void ai_worker_thread() {
         }
 
         // 3. 開始推論 (這裡會花 0.8s，但不會卡住主畫面)
-        Mat input_blob_mat;
-        resize(input_mat, input_blob_mat, Size(INPUT_WIDTH, INPUT_HEIGHT));
-        cvtColor(input_blob_mat, input_blob_mat, COLOR_BGR2RGB);
+        // 預處理：使用 OpenCV 直接轉成 NCHW Float32
+        // 這行會自動完成：Resize(224x224) + SwapRB(BGR->RGB) + Normalize(0~1) + Layout(HWC->NCHW)
+        // 這是最穩定的做法，不依賴 TNN 的轉換
+        Mat blob;
+        cv::dnn::blobFromImage(input_mat, blob, 
+                               1.0 / 255.0,             // Scale: 壓縮到 0~1
+                               Size(INPUT_WIDTH, INPUT_HEIGHT), // Resize
+                               Scalar(0, 0, 0),         // Mean: 0
+                               true,                    // SwapRB: BGR -> RGB (重要！)
+                               false);                  // Crop
 
-        // 設定輸入
-        // 使用 TNN 提供的工具將 OpenCV Mat 轉成 TNN Blob
-        // 注意：這裡假設 input_blob_mat 是連續記憶體
-        // 誠實告訴 TNN，傳進來的資料是 {1, 224, 224, 3} (Height, Width, Channel)
-        // TNN 的 SetInputMat 會自動幫你把 HWC [224, 224, 3] 轉成模型需要的 NCHW [1, 3, 224, 224]
+        // 建立 TNN Mat，直接指向 blob 的資料
+        // 注意：blob 是連續的 float 記憶體，格式為 NCHW
         std::shared_ptr<tnn::Mat> tnn_mat = std::make_shared<tnn::Mat>(
             tnn::DEVICE_ARM,
-            tnn::N8UC3, 
-            std::vector<int>{1, INPUT_HEIGHT, INPUT_WIDTH, 3}, // <--- 關鍵修改
-            input_blob_mat.data
+            tnn::NCHW_FLOAT, // 明確指定這是 NCHW 的 Float
+            std::vector<int>{1, 3, INPUT_HEIGHT, INPUT_WIDTH}, 
+            blob.data // 直接拿 OpenCV 算好的指標
         );
 
-        // instance->SetInputMat(tnn_mat, tnn::MatConvertParam());
-        // 設定歸一化參數：(x - mean) * scale
-        // YOLO 通常不需要 mean，但需要 scale 壓縮到 0~1
+        // 因為我們已經在 blobFromImage 做過 Normalize 了
+        // 所以這裡告訴 TNN 不要做任何轉換 (scale=1, bias=0)
         tnn::MatConvertParam input_cvt_param;
-        input_cvt_param.scale = {1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0};
+        // 預設就是不做轉換，所以其實可以不設，但為了安全：
+        input_cvt_param.scale = {1.0, 1.0, 1.0};
         input_cvt_param.bias = {0.0, 0.0, 0.0};
 
         instance->SetInputMat(tnn_mat, input_cvt_param);

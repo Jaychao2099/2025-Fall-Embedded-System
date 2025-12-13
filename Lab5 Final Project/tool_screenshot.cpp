@@ -1,234 +1,243 @@
-#include <fcntl.h>
-#include <fstream>
+/**
+ * Modified tool_screenshot_v2.cpp
+ * Based on 5_1_main_v2.cpp architecture
+ * Features:
+ * 1. Mmap based Framebuffer writing (Fast)
+ * 2. Separate thread for saving images (Non-blocking UI)
+ * 3. Terminal raw mode for input
+ */
+
 #include <iostream>
-#include <linux/fb.h>
-#include <opencv2/highgui/highgui.hpp>
-#include <opencv2/imgproc/imgproc.hpp>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <ctime>
-#include <sstream>
-#include <iomanip>
-#include <termios.h>
-#include <sys/stat.h>
+#include <vector>
 #include <string>
-#include <vector> // For std::vector
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <cstring>
+#include <sys/stat.h>
+#include <termios.h>
+#include <sstream>
 
-struct framebuffer_info
-{
-    uint32_t bits_per_pixel;
-    uint32_t xres_virtual;
-    uint32_t xres;
-    uint32_t yres;
-};
+#include <opencv2/opencv.hpp>
 
-struct framebuffer_info get_framebuffer_info ( const char *framebuffer_device_path );
+using namespace std;
+using namespace cv;
+
+// ================= 全域變數與鎖 =================
+std::mutex data_mutex;           // 保護共享資料
+Mat global_frame_to_save;        // 要儲存的圖片緩衝區
+bool save_request = false;       // 觸發存檔的訊號
+std::atomic<bool> is_running(true); // 程式運行狀態
+
+// 終端機設定 (用於讀取鍵盤)
+static struct termios orig_termios;
+
+// ================= 輔助函式宣告 =================
 void set_terminal_mode(bool enable_raw);
 int kbhit();
 
-// 保存原始終端設置
-static struct termios orig_termios;
-
-int main ( int argc, const char *argv[] )
-{
-    cv::Mat frame;
-    cv::Mat resized_frame; // *** 新增：用於存放縮放後影像的 Mat ***
-    cv::Mat frame_bgr565;
-
-    cv::VideoCapture camera (2, cv::CAP_V4L);
-
-    struct framebuffer_info fb_info = get_framebuffer_info("/dev/fb0");
-
-    std::ofstream ofs("/dev/fb0", std::ios::out | std::ios::binary);
-
-    if( !camera.isOpened() )
-    {
-        std::cerr << "Could not open video device." << std::endl;
-        return 1;
-    }
-
-    if( !ofs.is_open() )
-    {
-        std::cerr << "Could not open framebuffer device." << std::endl;
-        return 1;
-    }
-
-    // 原始攝影機解析度設定可以保留，以確保來源影像的穩定性
-    camera.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    camera.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    camera.set(cv::CAP_PROP_FPS, 30);
-
-    std::cout << "Camera started. Press 'c' to capture screenshot, ESC to exit." << std::endl;
-    std::cout << "Framebuffer: " << fb_info.xres << "x" << fb_info.yres << std::endl;
-
-    // 設置終端為原始模式，可以立即讀取按鍵
-    set_terminal_mode(true);
-
-    int screenshot_count = 0;
-    bool running = true;
-
-    // 決定並創建本次執行的截圖資料夾
-    std::string screenshot_dir_path;
+// ================= 存檔工作執行緒 =================
+// 這個執行緒專門負責將圖片寫入 SD 卡/硬碟，避免卡住畫面
+void saver_thread_func() {
+    // 1. 準備存檔路徑 (與原版邏輯相同，自動建立新資料夾)
+    string screenshot_dir_path;
     int dir_index = 0;
     while (true) {
-        std::stringstream path_ss;
+        stringstream path_ss;
+        // 注意：請根據您的板子實際路徑修改，這裡保留原版路徑
         path_ss << "/run/media/mmcblk1p1/screenshot_" << dir_index;
-        std::string path_to_check = path_ss.str();
+        string path_to_check = path_ss.str();
         
         struct stat st;
         if (stat(path_to_check.c_str(), &st) == -1) {
             if (mkdir(path_to_check.c_str(), 0755) == 0) {
                 screenshot_dir_path = path_to_check;
-                std::cout << "Screenshot directory created: " << screenshot_dir_path << std::endl;
+                cout << "[Saver Thread] Directory created: " << screenshot_dir_path << endl;
                 break;
             } else {
-                std::cerr << "Error creating directory: " << path_to_check << std::endl;
-                screenshot_dir_path = "."; 
+                screenshot_dir_path = "."; // 失敗就存當前目錄
                 break;
             }
         }
         dir_index++;
     }
 
-    while ( running )
-    {
-        camera >> frame;
-        
-        if(frame.empty()) {
-            std::cerr << "Could not grab frame." << std::endl;
+    int screenshot_count = 0;
+    Mat local_img_to_save;
+
+    while (is_running) {
+        bool has_job = false;
+
+        // 2. 檢查是否有存檔請求
+        {
+            lock_guard<mutex> lock(data_mutex);
+            if (save_request) {
+                // 複製圖片出來，盡快釋放鎖，讓主程式繼續跑
+                local_img_to_save = global_frame_to_save.clone();
+                save_request = false;
+                has_job = true;
+            }
+        }
+
+        // 3. 執行存檔 (耗時操作)
+        if (has_job && !local_img_to_save.empty()) {
+            stringstream filename_ss;
+            filename_ss << screenshot_dir_path << "/" << screenshot_count << ".bmp";
+            string filename = filename_ss.str();
+
+            if (imwrite(filename, local_img_to_save)) {
+                screenshot_count++;
+                cout << "\r[Saved] " << filename << " (Total: " << screenshot_count << ")    " << flush;
+            } else {
+                cerr << "\r[Error] Failed to save " << filename << flush;
+            }
+        } else {
+            // 沒工作就休息，避免佔用 CPU
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+}
+
+// ================= 主程式 =================
+int main() {
+    // 1. 初始化 Framebuffer (使用 mmap，參考 5_1_main_v2.cpp)
+    int fb = open("/dev/fb0", O_RDWR);
+    if (fb < 0) {
+        cerr << "Error: Cannot open /dev/fb0" << endl;
+        return -1;
+    }
+
+    struct fb_var_screeninfo vinfo;
+    if (ioctl(fb, FBIOGET_VSCREENINFO, &vinfo)) {
+        cerr << "Error: Cannot get screen info" << endl;
+        close(fb);
+        return -1;
+    }
+    
+    int screen_w = vinfo.xres;
+    int screen_h = vinfo.yres;
+    int bpp = vinfo.bits_per_pixel;
+    int screensize = screen_w * screen_h * bpp / 8;
+
+    cout << "Screen Info: " << screen_w << "x" << screen_h << " " << bpp << "bpp" << endl;
+
+    unsigned char* fbp = (unsigned char*)mmap(0, screensize, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
+    if ((intptr_t)fbp == -1) {
+        cerr << "Error: mmap failed" << endl;
+        close(fb);
+        return -1;
+    }
+
+    // 2. 初始化相機
+    VideoCapture cap(2);
+    if (!cap.isOpened()) {
+        cerr << "Error: Cannot open camera 2" << endl;
+        munmap(fbp, screensize);
+        close(fb);
+        return -1;
+    }
+    // 設定相機參數 (可選)
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+
+    // 3. 啟動存檔執行緒
+    thread saver(saver_thread_func);
+
+    // 設定終端機為 Raw mode 以讀取按鍵
+    set_terminal_mode(true);
+
+    cout << "Started. Press 'c' to capture, 'ESC' to exit." << endl;
+
+    Mat frame, display_frame;
+    
+    while (is_running) {
+        // A. 讀取畫面
+        cap >> frame;
+        if (frame.empty()) {
+            cerr << "Empty frame!" << endl;
             break;
         }
 
-        // *** 修改：將影像縮放至與 framebuffer 相同大小 ***
-        cv::resize(frame, resized_frame, cv::Size(fb_info.xres, fb_info.yres));
+        // B. 處理顯示 (縮放並轉為 BGR565)
+        // 縮放至全螢幕
+        resize(frame, display_frame, Size(screen_w, screen_h));
+        // 轉色
+        cvtColor(display_frame, display_frame, COLOR_BGR2BGR565);
 
-        // *** 移除：不再需要計算置中偏移量 ***
-        // int offset_x = (fb_info.xres_virtual - frame_size.width) / 2;
-        // int offset_y = (fb_info.yres - frame_size.height) / 2;
-
-        // 將縮放後的影像轉換為 BGR565 格式
-        cv::cvtColor(resized_frame, frame_bgr565, cv::COLOR_BGR2BGR565);
-
-        // 首次清空 framebuffer (可保留)
-        static bool first_frame = true;
-        if(first_frame) {
-            ofs.seekp(0);
-            int total_bytes = fb_info.yres * fb_info.xres_virtual * (fb_info.bits_per_pixel / 8);
-            std::vector<char> black_buffer(total_bytes, 0);
-            ofs.write(black_buffer.data(), total_bytes);
-            first_frame = false;
-        }
-
-        // *** 修改：寫入影像到 framebuffer，以填滿整個螢幕 ***
-        for ( int y = 0; y < fb_info.yres; y++ )
-        {
-            // 直接計算每行的起始位置，不再需要偏移
-            int pos = y * fb_info.xres_virtual * (fb_info.bits_per_pixel / 8);
-            ofs.seekp(pos);
-
-            // 取得縮放後影像的該行指標
-            uchar* row_ptr = frame_bgr565.ptr<uchar>(y);
-            // 要寫入的位元組數為螢幕的寬度
-            int bytes_per_row = fb_info.xres * (fb_info.bits_per_pixel / 8);
-            ofs.write(reinterpret_cast<char*>(row_ptr), bytes_per_row);
-        }
-        
-        ofs.flush();
-        
-        // 檢查是否有按鍵輸入
-        if(kbhit()) {
-            int key = getchar();
-            if(key == -1) continue;
-            
-            if(key == 27) {
-                std::cout << "\nExiting..." << std::endl;
-                running = false;
+        // C. 寫入 Framebuffer (直接記憶體拷貝，極快)
+        // 假設是 16-bit (2 bytes) 色彩深度
+        if (bpp == 16) {
+            for (int y = 0; y < screen_h; y++) {
+                // 計算記憶體偏移量
+                long int location = (y * screen_w) * 2;
+                // 使用 memcpy 複製一整行
+                memcpy(fbp + location, display_frame.ptr(y), screen_w * 2);
             }
-            else if(key == 'c' || key == 'C') {
-                std::stringstream filename_ss;
-                filename_ss << screenshot_dir_path << "/" << screenshot_count << ".bmp";
-                
-                // *** 注意：這裡儲存的是原始、未縮放的 'frame'，以保持最佳畫質 ***
-                if(cv::imwrite(filename_ss.str(), frame)) {
-                    screenshot_count++;
-                    std::cout << "\rScreenshot saved: " << filename_ss.str() 
-                              << " (Total this session: " << screenshot_count << ")" << std::flush;
-                } else {
-                    std::cout << "\rFailed to save screenshot: " << filename_ss.str() << std::flush;
+        } else {
+            // 如果不是 16bit，這裡需要額外處理 (大多數開發板是 16bit)
+            // 這裡簡單防呆
+        }
+
+        // D. 檢查按鍵輸入
+        if (kbhit()) {
+            int key = getchar();
+            
+            if (key == 27) { // ESC
+                is_running = false;
+            } else if (key == 'c' || key == 'C') {
+                // 觸發存檔請求
+                lock_guard<mutex> lock(data_mutex);
+                if (!save_request) { // 如果上一次存檔還沒處理完，就忽略這次按鍵(防連點)
+                    global_frame_to_save = frame.clone(); // 存原始高畫質圖
+                    save_request = true;
+                    // cout << "Request sent." << endl; 
                 }
             }
         }
         
-        // 短暫延遲以控制幀率
-        usleep(33000); // 約30 FPS
+        // 控制 FPS，避免吃滿 CPU
+        // usleep(1000); 
     }
 
-    // 恢復終端設置
+    // 清理資源
     set_terminal_mode(false);
-
-    camera.release();
-    ofs.close();
-
-    std::cout << "\nTotal screenshots taken: " << screenshot_count << std::endl;
+    cout << "\nWaiting for saver thread to finish..." << endl;
+    saver.join(); // 等待存檔執行緒結束
+    
+    munmap(fbp, screensize);
+    close(fb);
+    cout << "Program exited." << endl;
 
     return 0;
 }
 
-struct framebuffer_info get_framebuffer_info ( const char *framebuffer_device_path )
-{
-    struct framebuffer_info fb_info;
-    struct fb_var_screeninfo screen_info;
-
-    int fd = open(framebuffer_device_path, O_RDWR);
-    if(fd == -1) {
-        std::cerr << "Error: cannot open framebuffer device " << framebuffer_device_path << std::endl;
-        exit(1); // Exit if framebuffer cannot be opened
-    }
-
-    if(ioctl(fd, FBIOGET_VSCREENINFO, &screen_info) == -1) {
-        std::cerr << "Error: cannot get variable screen info" << std::endl;
-        close(fd);
-        exit(1); // Exit on error
-    }
-
-    fb_info.xres_virtual = screen_info.xres_virtual;
-    fb_info.bits_per_pixel = screen_info.bits_per_pixel;
-    fb_info.xres = screen_info.xres;
-    fb_info.yres = screen_info.yres;
-
-    close(fd);
-    return fb_info;
-}
-
-void set_terminal_mode(bool enable_raw)
-{
-    if(enable_raw) {
+// ================= 終端機控制函式 =================
+void set_terminal_mode(bool enable_raw) {
+    if (enable_raw) {
         tcgetattr(STDIN_FILENO, &orig_termios);
-        
         struct termios raw = orig_termios;
         raw.c_lflag &= ~(ICANON | ECHO); 
         raw.c_cc[VMIN] = 0;
         raw.c_cc[VTIME] = 0;
-        
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-        
         int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
         fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-    }
-    else {
+    } else {
         tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
         int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
         fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
     }
 }
 
-int kbhit()
-{
+int kbhit() {
     struct timeval tv = {0, 0};
     fd_set readfds;
-    
     FD_ZERO(&readfds);
     FD_SET(STDIN_FILENO, &readfds);
-    
     return select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv) > 0;
 }

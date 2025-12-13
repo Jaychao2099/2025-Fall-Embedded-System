@@ -40,3 +40,15 @@ logs/*
 *.tar*
 *.zip*
 *.rar*
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+*.pb
+*.h5
+*.log
+*.csv
+*.json
+*.db
+*.tnn*
