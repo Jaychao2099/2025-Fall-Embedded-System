@@ -17,6 +17,8 @@
 #include "tnn/core/blob.h"
 #include "tnn/utils/mat_utils.h"
 
+#include <arm_neon.h>
+
 using namespace std;
 using namespace cv;
 
@@ -75,22 +77,103 @@ float get_iou(const cv::Rect& box1, const cv::Rect& box2) {
 }
 
 // 執行 NMS 去除重疊框
+// ================= NEON 加速版 NMS =================
 void nms(vector<Object>& objects, float threshold) {
+    if (objects.empty()) return;
+
+    // 1. 先排序 (機率高 -> 低)
     sort(objects.begin(), objects.end(), [](const Object& a, const Object& b) {
         return a.prob > b.prob;
     });
 
-    for (size_t i = 0; i < objects.size(); ++i) {
-        if (objects[i].prob == 0) continue;
-        for (size_t j = i + 1; j < objects.size(); ++j) {
-            if (objects[j].prob == 0) continue;
-            if (get_iou(objects[i].rect, objects[j].rect) > threshold) {
-                objects[j].prob = 0; // 標記為刪除
+    int n = objects.size();
+    
+    // 2. 轉換資料結構 (AoS -> SoA) 以便 NEON 平行載入
+    // 我們需要連續的記憶體來存放座標，並轉成 float
+    vector<float> x1(n), y1(n), x2(n), y2(n), areas(n);
+
+    for (int i = 0; i < n; ++i) {
+        x1[i] = (float)objects[i].rect.x;
+        y1[i] = (float)objects[i].rect.y;
+        x2[i] = (float)(objects[i].rect.x + objects[i].rect.width);
+        y2[i] = (float)(objects[i].rect.y + objects[i].rect.height);
+        areas[i] = (float)(objects[i].rect.width * objects[i].rect.height);
+    }
+
+    // 補齊到 4 的倍數，避免 NEON 讀取越界 (Padding)
+    int padded_n = (n + 3) & ~3; 
+    x1.resize(padded_n, 0); y1.resize(padded_n, 0);
+    x2.resize(padded_n, 0); y2.resize(padded_n, 0);
+    areas.resize(padded_n, 0);
+
+    // 3. NEON 平行計算核心
+    // 準備全 0 向量 (用於計算 max(0, w))
+    float32x4_t v_zero = vdupq_n_f32(0.0f);
+    // 準備 Threshold 向量
+    float32x4_t v_thresh = vdupq_n_f32(threshold);
+
+    for (int i = 0; i < n; ++i) {
+        if (objects[i].prob == 0) continue; // 已經被刪掉的跳過
+
+        // 載入當前最高分框 (Box A) 的參數，複製到所有通道
+        float32x4_t a_x1 = vdupq_n_f32(x1[i]);
+        float32x4_t a_y1 = vdupq_n_f32(y1[i]);
+        float32x4_t a_x2 = vdupq_n_f32(x2[i]);
+        float32x4_t a_y2 = vdupq_n_f32(y2[i]);
+        float32x4_t a_area = vdupq_n_f32(areas[i]);
+
+        // 檢查剩餘的框 (每次處理 4 個)
+        for (int j = i + 1; j < padded_n; j += 4) {
+            // 如果這 4 個索引都超過原始 n，就不用算了 (因為是 padding 的)
+            if (j >= n) break;
+
+            // 載入 4 個候選框 (Box B)
+            float32x4_t b_x1 = vld1q_f32(&x1[j]);
+            float32x4_t b_y1 = vld1q_f32(&y1[j]);
+            float32x4_t b_x2 = vld1q_f32(&x2[j]);
+            float32x4_t b_y2 = vld1q_f32(&y2[j]);
+            float32x4_t b_area = vld1q_f32(&areas[j]);
+
+            // 計算交集座標 (Intersection)
+            // inter_x1 = max(a_x1, b_x1)
+            float32x4_t inter_x1 = vmaxq_f32(a_x1, b_x1);
+            float32x4_t inter_y1 = vmaxq_f32(a_y1, b_y1);
+            // inter_x2 = min(a_x2, b_x2)
+            float32x4_t inter_x2 = vminq_f32(a_x2, b_x2);
+            float32x4_t inter_y2 = vminq_f32(a_y2, b_y2);
+
+            // 計算交集寬高 w = max(0, inter_x2 - inter_x1)
+            float32x4_t w = vmaxq_f32(vsubq_f32(inter_x2, inter_x1), v_zero);
+            float32x4_t h = vmaxq_f32(vsubq_f32(inter_y2, inter_y1), v_zero);
+
+            // 計算交集面積
+            float32x4_t inter_area = vmulq_f32(w, h);
+
+            // 計算聯集面積 (Union = A + B - Inter)
+            float32x4_t union_area = vsubq_f32(vaddq_f32(a_area, b_area), inter_area);
+
+            // 判斷 IoU > Threshold
+            // 優化技巧：避免除法！ 改成判斷 Inter > Threshold * Union
+            float32x4_t limit = vmulq_f32(union_area, v_thresh);
+            // mask 結果: 符合條件的 bit 會全為 1 (NaN/Inf)，否則為 0
+            uint32x4_t mask = vcgtq_f32(inter_area, limit);
+
+            // 將結果存回陣列檢查
+            // 這裡我們直接把 4 個結果讀出來處理
+            // (雖然也可以用 NEON 位元運算處理，但存回 vector<Object> 需要迴圈，這樣寫最直觀)
+            uint32_t res[4];
+            vst1q_u32(res, mask);
+
+            for (int k = 0; k < 4; ++k) {
+                int cur_idx = j + k;
+                if (cur_idx < n && res[k] != 0) { // res[k] != 0 代表 IoU > Threshold
+                    objects[cur_idx].prob = 0; // 標記刪除
+                }
             }
         }
     }
     
-    // 移除被標記的框
+    // 4. 移除被標記的框
     objects.erase(remove_if(objects.begin(), objects.end(), 
         [](const Object& obj) { return obj.prob == 0; }), objects.end());
 }
@@ -229,8 +312,9 @@ void ai_worker_thread() {
         {
             lock_guard<mutex> lock(frame_mutex);
             if (new_frame_ready) {
-                // 複製圖片過來，避免主執行緒修改
-                input_mat = global_frame_for_ai.clone(); 
+                // 優化：直接拿 Reference (淺拷貝)，不複製像素資料
+                // 因為主執行緒下次更新時會配置新記憶體，不會影響這塊舊的資料
+                input_mat = global_frame_for_ai; // <--- 改成這樣就好，只是指標賦值
                 new_frame_ready = false; // 標記已取走
                 has_job = true;
             }

@@ -229,8 +229,9 @@ void ai_worker_thread() {
         {
             lock_guard<mutex> lock(frame_mutex);
             if (new_frame_ready) {
-                // 複製圖片過來，避免主執行緒修改
-                input_mat = global_frame_for_ai.clone(); 
+                // 優化：直接拿 Reference (淺拷貝)，不複製像素資料
+                // 因為主執行緒下次更新時會配置新記憶體，不會影響這塊舊的資料
+                input_mat = global_frame_for_ai; // <--- 改成這樣就好，只是指標賦值
                 new_frame_ready = false; // 標記已取走
                 has_job = true;
             }
