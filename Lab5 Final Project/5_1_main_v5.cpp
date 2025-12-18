@@ -2,15 +2,16 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <thread> // 新增: 執行緒
-#include <mutex>  // 新增: 互斥鎖
-#include <atomic> // 新增: 原子變數
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
+#include <fstream>
 
 #include <opencv2/opencv.hpp>
 #include "tnn/core/tnn.h"
@@ -36,8 +37,8 @@ std::mutex frame_mutex;
 
 // 共享資料
 vector<Object> global_objects;     // 最新的偵測結果
-Mat global_frame_for_ai;           // 要給 AI 算的圖片
-bool new_frame_ready = false;      // 告訴 AI 有新圖了
+Mat ai_buffer;                     // 共享緩衝區
+bool new_frame_ready_flag = false; // 告訴 AI 有新圖了
 std::atomic<bool> is_running(true);// 程式是否繼續執行
 
 // ================= 設定區域 =================
@@ -55,32 +56,9 @@ const int DISP_WIDTH = 640;
 const int DISP_HEIGHT = 480;
 // 類別名稱
 const vector<string> CLASS_NAMES = {
-    "banana", 
-    "book", 
-    "bottle", 
-    "cell phone", 
-    "cup",
-    "keyboard", 
-    "scissors", 
-    "spoon", 
+    "banana", "book", "bottle", "cell phone", 
+    "cup", "keyboard", "scissors", "spoon", 
 };
-
-// ================= 輔助函式 (NMS 與 後處理) =================
-
-// 計算 IoU (Intersection over Union)
-float get_iou(const cv::Rect& box1, const cv::Rect& box2) {
-    int x1 = max(box1.x, box2.x);
-    int y1 = max(box1.y, box2.y);
-    int x2 = min(box1.x + box1.width, box2.x + box2.width);
-    int y2 = min(box1.y + box1.height, box2.y + box2.height);
-
-    if (x1 >= x2 || y1 >= y2) return 0.0f;
-
-    float intersection = (x2 - x1) * (y2 - y1);
-    float area1 = box1.width * box1.height;
-    float area2 = box2.width * box2.height;
-    return intersection / (area1 + area2 - intersection);
-}
 
 // 執行 NMS 去除重疊框
 // ================= NEON 加速版 NMS =================
@@ -211,7 +189,6 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
     // 2. 參數設定
     int num_anchors  = 1029; // 224x224 (7x7 + 14x14 + 28x28)
     int num_classes  = 8;
-    int num_channels = 4 + num_classes; // 12
     
     // 縮放比例
     float scale_x = (float)frame_w / INPUT_WIDTH;
@@ -253,7 +230,6 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
             int y1 = max(0, min((int)y, frame_h - 1));
             int w1 = min((int)width, frame_w - x1);
             int h1 = min((int)height, frame_h - y1);
-            
             if (w1 > 0 && h1 > 0) {
                 Object obj;
                 obj.rect = cv::Rect(x1, y1, w1, h1);
@@ -263,28 +239,25 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
             }
         }
     }
-
     nms(objects, NMS_THRESHOLD);
 }
 
 // ================= AI 工作執行緒 =================
 void ai_worker_thread() {
     // 1. 在執行緒內部初始化 TNN (每個執行緒獨立的 Instance 比較安全)
-    // cout << "[AI Thread] Init TNN..." << endl;
+    string proto_content, model_content;
     
     // 讀取 Proto (網路結構)
-    string proto_content;
     {
         ifstream proto_file(MODEL_PROTO);
-        if (!proto_file.is_open()) { cerr << "Proto file not found!" << endl; return; }
+        if (!proto_file.is_open()) { cerr << "Proto error!" << endl; return; }
         proto_content = string((istreambuf_iterator<char>(proto_file)), istreambuf_iterator<char>());
     }
 
     // 讀取 Model (權重)
-    string model_content;
     {
         ifstream model_file(MODEL_BIN, ios::binary);
-        if (!model_file.is_open()) { cerr << "Model file not found!" << endl; return; }
+        if (!model_file.is_open()) { cerr << "Model error!" << endl; return; }
         model_content = string((istreambuf_iterator<char>(model_file)), istreambuf_iterator<char>());
     }
 
@@ -303,13 +276,14 @@ void ai_worker_thread() {
     auto instance = tnn_net.CreateInst(network_config, status);
 
     if (status != tnn::TNN_OK) {
-        cerr << "[AI Thread] Init failed!" << endl;
+        cerr << "[AI] Init failed!" << endl;
         return;
     }
     
-    // cout << "[AI Thread] Ready loop." << endl;
+    // !!! 優化：設定 TNN 使用 2 核心 !!!
+    instance->SetCpuNumThreads(2);
 
-    Mat input_mat;
+    Mat local_input_mat; // AI 執行緒私有的 Mat
     vector<Object> local_objects;
 
     while (is_running) {
@@ -317,12 +291,11 @@ void ai_worker_thread() {
         bool has_job = false;
         {
             lock_guard<mutex> lock(frame_mutex);
-            if (new_frame_ready) {
-                // 優化：直接拿 Reference (淺拷貝)，不複製像素資料
-                // 因為主執行緒下次更新時會配置新記憶體，不會影響這塊舊的資料
-                input_mat = global_frame_for_ai; // <--- 改成這樣就好，只是指標賦值
-                new_frame_ready = false; // 標記已取走
+            if (new_frame_ready_flag) {
+                // !!! 修正：在鎖內進行複製，防止資料競爭 !!!
+                ai_buffer.copyTo(local_input_mat);
                 has_job = true;
+                new_frame_ready_flag = false;
             }
         }
 
@@ -332,12 +305,13 @@ void ai_worker_thread() {
             continue;
         }
 
+        // --- 以下操作安全，因為 local_input_mat 是私有的 ---
         // 3. 開始推論 (這裡會花 0.8s，但不會卡住主畫面)
         // 預處理：使用 OpenCV 直接轉成 NCHW Float32
         // 這行會自動完成：Resize(224x224) + SwapRB(BGR->RGB) + Normalize(0~1) + Layout(HWC->NCHW)
         // 這是最穩定的做法，不依賴 TNN 的轉換
         Mat blob;
-        cv::dnn::blobFromImage(input_mat, blob, 
+        cv::dnn::blobFromImage(local_input_mat, blob, 
                                1.0 / 255.0,             // Scale: 壓縮到 0~1
                                Size(INPUT_WIDTH, INPUT_HEIGHT), // Resize
                                Scalar(0, 0, 0),         // Mean: 0
@@ -354,36 +328,35 @@ void ai_worker_thread() {
         );
 
         // 因為我們已經在 blobFromImage 做過 Normalize 了
-        // 所以這裡告訴 TNN 不要做任何轉換 (scale=1, bias=0)
+        // 預設值即可
         tnn::MatConvertParam input_cvt_param;
-        // 預設就是不做轉換，所以其實可以不設，但為了安全：
-        input_cvt_param.scale = {1.0, 1.0, 1.0};
-        input_cvt_param.bias = {0.0, 0.0, 0.0};
-
+        // // 預設就是不做轉換，所以其實可以不設，但為了安全：
+        // input_cvt_param.scale = {1.0, 1.0, 1.0};
+        // input_cvt_param.bias = {0.0, 0.0, 0.0};
         instance->SetInputMat(tnn_mat, input_cvt_param);
         
         // 推論
         instance->Forward();
-
-        // 後處理
-        // 注意：這裡傳入的是原始圖片的大小 (input_mat.cols)，不是 224
-        postProcess(instance, local_objects, input_mat.cols, input_mat.rows);
+        
+        // 傳入的尺寸是 local_input_mat 的尺寸 (640x480)
+        postProcess(instance, local_objects, local_input_mat.cols, local_input_mat.rows);
 
         // 4. 更新全域結果
         {
             lock_guard<mutex> lock(result_mutex);
-            global_objects = local_objects; // 把算好的框框丟出去
+            global_objects = local_objects;
         }
-        // cout << "[AI Thread] Updated objects: " << local_objects.size() << endl;
     }
 }
 
-// ================= 主程式 (顯示緒) =================
+// ================= 主程式 =================
 int main() {
-    // Framebuffer Init
+    // 暴力定頻
+    system("echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+    
     int fb = open("/dev/fb0", O_RDWR);
     if (fb < 0) {
-        cerr << "Error: Cannot open /dev/fb0" << endl;
+        cerr << "FB Error" << endl;
         return -1;
     }
 
@@ -409,87 +382,81 @@ int main() {
     // Camera Init
     VideoCapture cap(2);
     if (!cap.isOpened()) {
-        cerr << "Error: Cannot open camera 2" << endl;
+        cerr << "Cam Error" << endl;
         return -1;
     }
+    
+    // 關鍵優化：降低來源解析度
+    // 其實可以不用，夠快了
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 
-    // 啟動 AI 執行緒
-    thread ai_thread(ai_worker_thread); // <--- 這裡啟動分身
+    // 預先配置記憶體，避免 copyTo 時重新 malloc
+    ai_buffer.create(480, 640, CV_8UC3);
 
-    Mat frame, display_frame;
+    thread ai_thread(ai_worker_thread);
+
+    Mat capture_frame, display_frame;
     vector<Object> current_objects_to_draw;
 
-    // cout << "Main loop started..." << endl;
-
     while (true) {
-        // 1. 讀取畫面 (快速)
-        cap >> frame;
-        if (frame.empty()) break;
+        cap >> capture_frame;
+        if (capture_frame.empty()) break;
 
-        // 2. 傳送圖片給 AI (如果有空閒)
+        // 嘗試送圖給 AI
         {
-            // 使用 try_lock 或者直接 lock，因為這裡很快
-            lock_guard<mutex> lock(frame_mutex);
-            if (!new_frame_ready) { // 如果 AI 還沒拿走上一張，我們就不要覆蓋 (或者你想覆蓋也可以)
-                // 這裡選擇：如果 AI 正在忙，我們就更新成最新的圖，讓他一忙完就拿到最新的
-                global_frame_for_ai = frame.clone(); // 必須 clone
-                new_frame_ready = true;
+            // 使用 try_lock 避免卡住畫面
+            if (frame_mutex.try_lock()) {
+                capture_frame.copyTo(ai_buffer); 
+                new_frame_ready_flag = true;
+                frame_mutex.unlock();
             }
         }
 
-        // 3. 取得目前最新的偵測結果
+        // 取得結果
         {
             lock_guard<mutex> lock(result_mutex);
-            current_objects_to_draw = global_objects; // 複製一份拿來畫
+            current_objects_to_draw = global_objects;
         }
 
-        // 4. 畫圖 (畫在目前的 frame 上)
-        // 注意：因為 frame 是新的，但 box 可能是 0.8 秒前的，
-        // 所以物體移動太快時，框框會有點跟不上 (Lag)，這是正常的物理現象
+        // 畫圖 (在 640x480 上畫)
         for (const auto& obj : current_objects_to_draw) {
-            rectangle(frame, obj.rect, Scalar(0, 255, 0), 2);
-            
-            // 準備文字
+            rectangle(capture_frame, obj.rect, Scalar(0, 255, 0), 2);
             string label = CLASS_NAMES[obj.label] + " " + to_string((int)(obj.prob * 100)) + "%";
-            int baseLine;
-            Size labelSize = getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
             
-            // 確保文字不會跑出上邊界 (如果 y 太小，就畫在框框裡面)
-            int text_y = obj.rect.y - 5;
-            if (text_y < labelSize.height) {
-                text_y = obj.rect.y + labelSize.height + 5;
-            }
-
-            rectangle(frame, Point(obj.rect.x, text_y - labelSize.height),
-                      Point(obj.rect.x + labelSize.width, text_y + baseLine),
-                      Scalar(0, 255, 0), FILLED);
-            
-            putText(frame, label, Point(obj.rect.x, text_y),
-                    FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 0), 1);
+            // 簡單的防止文字出界處理
+            int y = obj.rect.y < 20 ? obj.rect.y + 20 : obj.rect.y - 5;
+            putText(capture_frame, label, Point(obj.rect.x, y),
+                    FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 2);
         }
 
         // 5. 顯示到 Framebuffer
-        resize(frame, display_frame, Size(DISP_WIDTH, DISP_HEIGHT));
+        // 顯示放大 (640x480 -> 640x480)
+        resize(capture_frame, display_frame, Size(DISP_WIDTH, DISP_HEIGHT));
         // 關鍵：轉成 BGR565 (嵌入式螢幕常用格式)
         cvtColor(display_frame, display_frame, COLOR_BGR2BGR565);
         
-        // 寫入 mmap 記憶體
-        // 假設是全螢幕左上角顯示
-        for (int y = 0; y < DISP_HEIGHT; y++) {
-            memcpy(fbp + ((0 + y) * width + 0) * 2, display_frame.ptr(y), DISP_WIDTH * 2);
+        // 複製到 Framebuffer (逐行複製)
+        // 假設螢幕也是 640x480，如果螢幕更大，這裡只會畫左上角
+        int copy_w = min(width, DISP_WIDTH);
+        int copy_h = min(height, DISP_HEIGHT);
+        
+        for (int y = 0; y < copy_h; y++) {
+            // 計算偏移量 (假設是 16bit color)
+            long location = (y * width) * 2;
+            memcpy(fbp + location, display_frame.ptr(y), copy_w * 2);
         }
 
         // 6. 離開檢查
-        int key = waitKey(1); 
-        if (key == 27) { is_running = false; break; }
+        // 會錯誤，先註解掉
+        // int key = waitKey(1); 
+        // if (key == 27) { is_running = false; break; }
     }
 
     is_running = false;
-    ai_thread.join(); // 等待 AI 執行緒結束
+    if(ai_thread.joinable()) ai_thread.join();
     
-    // --- 清理 ---
     munmap(fbp, screensize);
     close(fb);
-    cout << "Program exited." << endl;
     return 0;
 }

@@ -67,20 +67,20 @@ const vector<string> CLASS_NAMES = {
 
 // ================= 輔助函式 (NMS 與 後處理) =================
 
-// 計算 IoU (Intersection over Union)
-float get_iou(const cv::Rect& box1, const cv::Rect& box2) {
-    int x1 = max(box1.x, box2.x);
-    int y1 = max(box1.y, box2.y);
-    int x2 = min(box1.x + box1.width, box2.x + box2.width);
-    int y2 = min(box1.y + box1.height, box2.y + box2.height);
+// // 計算 IoU (Intersection over Union)
+// float get_iou(const cv::Rect& box1, const cv::Rect& box2) {
+//     int x1 = max(box1.x, box2.x);
+//     int y1 = max(box1.y, box2.y);
+//     int x2 = min(box1.x + box1.width, box2.x + box2.width);
+//     int y2 = min(box1.y + box1.height, box2.y + box2.height);
 
-    if (x1 >= x2 || y1 >= y2) return 0.0f;
+//     if (x1 >= x2 || y1 >= y2) return 0.0f;
 
-    float intersection = (x2 - x1) * (y2 - y1);
-    float area1 = box1.width * box1.height;
-    float area2 = box2.width * box2.height;
-    return intersection / (area1 + area2 - intersection);
-}
+//     float intersection = (x2 - x1) * (y2 - y1);
+//     float area1 = box1.width * box1.height;
+//     float area2 = box2.width * box2.height;
+//     return intersection / (area1 + area2 - intersection);
+// }
 
 // 執行 NMS 去除重疊框
 // ================= NEON 加速版 NMS =================
@@ -211,7 +211,7 @@ void postProcess(std::shared_ptr<tnn::Instance> instance,
     // 2. 參數設定
     int num_anchors  = 1029; // 224x224 (7x7 + 14x14 + 28x28)
     int num_classes  = 8;
-    int num_channels = 4 + num_classes; // 12
+    // int num_channels = 4 + num_classes; // 12
     
     // 縮放比例
     float scale_x = (float)frame_w / INPUT_WIDTH;
@@ -480,8 +480,8 @@ int main() {
         }
 
         // 6. 離開檢查
-        int key = waitKey(1); 
-        if (key == 27) { is_running = false; break; }
+        // int key = waitKey(1); 
+        // if (key == 27) { is_running = false; break; }
     }
 
     is_running = false;
