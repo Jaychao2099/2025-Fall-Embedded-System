@@ -49,8 +49,8 @@ const string MODEL_BIN   = "./best.opt.tnnmodel";
 const int INPUT_WIDTH = 224;
 const int INPUT_HEIGHT = 224;
 const int NUM_CLASSES = 8;         // 題目要求的8類
-const float CONF_THRESHOLD = 0.45; // 信心度門檻
-const float NMS_THRESHOLD = 0.45;  // 重疊過濾門檻
+float CONF_THRESHOLD = 0.45; // 信心度門檻
+float NMS_THRESHOLD = 0.45;  // 重疊過濾門檻
 // 顯示設定
 const int DISP_WIDTH = 640;
 const int DISP_HEIGHT = 480;
@@ -350,7 +350,23 @@ void ai_worker_thread() {
 }
 
 // ================= 主程式 =================
-int main() {
+int main(int argc, char** argv) {
+    // 參數解析邏輯
+    if (argc > 1) {
+        try {
+            CONF_THRESHOLD = std::stof(argv[1]);
+        } catch (...) {
+            cerr << "Warning: Invalid Conf Threshold, using default." << endl;
+        }
+    }
+    if (argc > 2) {
+        try {
+            NMS_THRESHOLD = std::stof(argv[2]);
+        } catch (...) {
+            cerr << "Warning: Invalid NMS Threshold, using default." << endl;
+        }
+    }
+
     // 暴力定頻
     system("echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
     
@@ -432,7 +448,9 @@ int main() {
 
         // 5. 顯示到 Framebuffer
         // 顯示放大 (640x480 -> 640x480)
-        resize(capture_frame, display_frame, Size(DISP_WIDTH, DISP_HEIGHT));
+        // resize(capture_frame, display_frame, Size(DISP_WIDTH, DISP_HEIGHT));
+        display_frame = capture_frame;
+        
         // 關鍵：轉成 BGR565 (嵌入式螢幕常用格式)
         cvtColor(display_frame, display_frame, COLOR_BGR2BGR565);
         
