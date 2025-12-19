@@ -43,11 +43,11 @@ std::atomic<bool> is_running(true);// 程式是否繼續執行
 
 // ================= 設定區域 =================
 // 模型路徑 (請確保檔案在板子上)
-const string MODEL_PROTO = "./best.opt.tnnproto";
-const string MODEL_BIN   = "./best.opt.tnnmodel";
+const string MODEL_PROTO = "./model.quantized.tnnproto";
+const string MODEL_BIN   = "./model.quantized.tnnmodel";
 // YOLOv8 訓練時設定的參數
-const int INPUT_WIDTH = 224;
-const int INPUT_HEIGHT = 224;
+const int INPUT_WIDTH = 320;
+const int INPUT_HEIGHT = 320;
 const int NUM_CLASSES = 8;         // 題目要求的8類
 float CONF_THRESHOLD = 0.45; // 信心度門檻
 float NMS_THRESHOLD = 0.45;  // 重疊過濾門檻

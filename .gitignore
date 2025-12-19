@@ -52,3 +52,12 @@ logs/*
 *.json
 *.db
 *.tnn*
+*.xlsx
+*.pptx
+*.docx
+*.so*
+*.pt
+*.onnx
+*.tnnmodel
+*.tnnproto
+*.dill
