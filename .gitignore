@@ -60,4 +60,7 @@ logs/*
 *.onnx
 *.tnnmodel
 *.tnnproto
+*.pdf
+*ipynb
+Lab4/
 *.dill
